@@ -768,7 +768,20 @@ def scrape_academic_rss_feeds(seen: set):
                 
         except Exception as e:
             print(f"  [-] Academic feed error for '{feed_url[:40]}...': {e}")
+            
+def test_telegram():
+    endpoint = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": "✅ PhD Finder Telegram test"
+    }
+
+    response = session.post(endpoint, json=payload, timeout=20)
+
+    print("STATUS:", response.status_code)
+    print("RESPONSE:", response.text)
+    
 def main():
     print("🚀 Running PhD Finder Agent on Cloud...")
     seen = load_seen()
@@ -788,4 +801,6 @@ def main():
     print("✅ Run complete. Exiting cleanly.")
 
 if __name__ == "__main__":
+    test_telegram()
     main()
+    
