@@ -523,11 +523,12 @@ def evaluate_with_gemini(text: str) -> dict:
 
 def send_alert(url: str, analysis: dict, snippet: str):
     if not isinstance(analysis, dict):
-        return
+        return False
+
     tier_badges = {1: "🔥 Tier 1", 2: "⚡ Tier 2", 3: "🛠 Tier 3"}
     tier_val = analysis.get("tier", 2)
     label = tier_badges.get(tier_val, "Relevant Opportunity")
-    
+
     score = analysis.get("confidence_score", "N/A")
     title = analysis.get("title", "PhD Opportunity")
     topics_list = analysis.get("key_topics", [])
@@ -535,28 +536,48 @@ def send_alert(url: str, analysis: dict, snippet: str):
     reason = analysis.get("reason", "Matches research profile.")
 
     msg = (
-        f"🎯 *New PhD Match!*\n"
-        f"*Category:* {label}\n"
-        f"*Score:* {score}/10\n"
-        f"*Title:* {title}\n"
-        f"*Topics:* `{topics}`\n\n"
-        f"💡 *Reason:* {reason}\n\n"
-        f"🔗 [Open Vacancy / Post]({url})\n"
+        f"🎯 <b>New PhD Match!</b>\n"
+        f"<b>Category:</b> {label}\n"
+        f"<b>Score:</b> {score}/10\n"
+        f"<b>Title:</b> {title}\n"
+        f"<b>Topics:</b> <code>{topics}</code>\n\n"
+        f"💡 <b>Reason:</b> {reason}\n\n"
+        f'🔗 <a href="{url}">Open Vacancy / Post</a>\n'
         f"────────────────────\n"
-        f"📝 *Preview:*\n{snippet[:250]}..."
+        f"📝 <b>Preview:</b>\n{snippet[:250]}..."
     )
-    
+
     endpoint = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
     payload = {
         "chat_id": CHAT_ID,
         "text": msg,
-        "parse_mode": "Markdown",
+        "parse_mode": "HTML",
         "disable_web_page_preview": False
     }
+
     try:
-        session.post(endpoint, json=payload, timeout=20)
+        response = session.post(endpoint, json=payload, timeout=20)
+
+        print(f"[Telegram] HTTP {response.status_code}")
+        print(f"[Telegram] Response: {response.text}")
+
+        if response.status_code != 200:
+            print("[-] Telegram failed to send message!")
+            return False
+
+        result = response.json()
+
+        if not result.get("ok"):
+            print(f"[-] Telegram API error: {result}")
+            return False
+
+        print("[+] Telegram alert sent successfully.")
+        return True
+
     except Exception as e:
         print(f"[-] Alert sending error: {e}")
+        return False
 
 def scrape_telegram_channel_deep(channel: str, seen: set):
     print(f"\n📡 Scanning @{channel}...")
