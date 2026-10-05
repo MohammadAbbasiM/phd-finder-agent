@@ -56,78 +56,391 @@ CHANNELS_TO_SCRAPE = [
     "PargarPositions"
 ]
 
-# Targeted regex for engineering / UWB / signal processing
+CHANNELS_TO_SCRAPE = [
+    "expertapply", "ApplyIR2UK", "applyforfree", "pargarwiki",
+    "applyclub", "ApplyDaily", "computer_phd_apply", "EuropeanPhD",
+    "PargarPositions"
+]
+
+# Targeted patterns for the candidate's research profile
 BROAD_PATTERNS = [
-    r"uwb", r"ultra[- ]wideband", r"indoor", r"localiz", r"position", r"radar",
-    r"csi\b", r"cir\b", r"ranging", r"tof\b", r"tdoa\b", r"nlos", r"wireless", r"rf\b",
-    r"fingerprint", r"channel impulse", r"channel state", r"signal processing", r"telecom",
-    r"machine learning", r"deep learning", r"transformer", r"neural", r"transfer learning",
-    r"domain adaptation", r"tracking", r"navigation", r"sensor fusion", r"slam",
-    r"autonomous", r"odometry", r"imu\b", r"fpga", r"sdr", r"embedded", r"edge ai",
-    r"tinyml", r"iot\b", r"vhdl", r"verilog", r"daq\b", r"data acquisition",
-    r"موقعیت", r"مکان[- ]?یابی", r"سیگنال", r"مخابرات", r"یادگیری", r"هوش مصنوعی",
-    r"نهفته", r"سنسور", r"رادار", r"دکتری", r"فاند", r"بورسیه", r"پوزیشن"
+    # ===== Tier 1: Direct Research Match =====
+    r"\bv[io]\b", r"visual[- ]inertial", r"visual[- ]inertial odometry",
+    r"\bvio\b", r"visual odometry",
+    r"visual[- ]inertial navigation",
+    r"visual navigation",
+    
+    r"\bslam\b", r"visual slam", r"visual[- ]inertial slam",
+    r"simultaneous localization and mapping",
+    r"localization and mapping",
+    
+    r"sensor fusion", r"multi[- ]sensor fusion",
+    r"multimodal sensor fusion",
+    r"camera[- ]imu", r"vision[- ]imu",
+    r"gnss[- ]imu", r"gnss/imu", r"gnss fusion",
+    
+    r"\bgnss\b", r"gps positioning", r"gnss positioning",
+    r"satellite positioning", r"robust positioning",
+    r"precise positioning", r"navigation system",
+    r"localization", r"positioning",
+    
+    # ===== Computer Vision / Robotics =====
+    r"computer vision", r"machine vision",
+    r"3d vision", r"3d computer vision",
+    r"image processing", r"video processing",
+    r"object detection", r"object tracking",
+    r"multi[- ]object tracking",
+    r"visual perception", r"scene understanding",
+    r"depth estimation", r"stereo vision",
+    r"visual localization", r"place recognition",
+    r"camera[- ]based navigation",
+    
+    r"robot localization", r"robot navigation",
+    r"autonomous navigation", r"autonomous systems",
+    r"mobile robot", r"mobile robotics",
+    r"field robotics", r"outdoor robotics",
+    r"autonomous robot", r"robot perception",
+    
+    # ===== ML / Deep Learning relevant to above =====
+    r"machine learning", r"deep learning",
+    r"neural network", r"transformer",
+    r"self[- ]supervised learning",
+    r"representation learning",
+    r"domain adaptation",
+    r"domain generalization",
+    r"uncertainty estimation",
+    r"probabilistic learning",
+    r"graph neural network", r"\bgnn\b",
+    
+    # ===== Optimization / Estimation =====
+    r"factor graph", r"factor graph optimization",
+    r"graph[- ]based optimization",
+    r"nonlinear optimization",
+    r"state estimation",
+    r"pose estimation",
+    r"trajectory estimation",
+    r"kalman filter", r"extended kalman",
+    r"particle filter",
+    r"probabilistic robotics",
+    
+    # ===== Sensor / Navigation Technologies =====
+    r"\bimu\b", r"inertial measurement",
+    r"inertial navigation", r"inertial sensing",
+    r"lidar", r"lidar[- ]based",
+    r"camera[- ]lidar", r"lidar[- ]camera",
+    r"gnss", r"rtk", r"pseudorange",
+    
+    # ===== Embedded / Edge AI =====
+    r"embedded ai", r"edge ai", r"edge computing",
+    r"embedded systems", r"embedded software",
+    r"embedded machine learning",
+    r"tinyml",
+    r"ai accelerator", r"hardware acceleration",
+    r"gpu acceleration", r"cuda",
+    r"nvidia jetson", r"edge robotics",
+    
+    r"ros\b", r"ros2", r"robot operating system",
+    
+    # ===== Electronics / Hardware (lower priority) =====
+    r"\bfpga\b", r"\bsdr\b", r"software defined radio",
+    r"vhdl", r"verilog",
+    r"digital hardware", r"digital systems",
+    r"embedded hardware",
+    
+    # ===== Persian =====
+    r"ناوبری", r"ناوبری هوشمند",
+    r"موقعیت[- ]?یابی", r"مکان[- ]?یابی",
+    r"بینایی ماشین", r"بینایی کامپیوتر",
+    r"پردازش تصویر", r"پردازش ویدئو",
+    r"یادگیری ماشین", r"یادگیری عمیق",
+    r"ادغام سنسورها", r"همجوشی سنسورها",
+    r"فیوژن سنسورها",
+    r"اسلم", r"ناوبری ربات",
+    r"ربات خودران", r"سیستم نهفته",
+    r"هوش مصنوعی لبه",
+    
+    # ===== Application / Position signals =====
+    r"\bphd\b", r"ph\.d", r"doctoral",
+    r"phd position", r"phd candidate",
+    r"doctoral position", r"research assistant",
+    r"funded phd", r"fully funded",
+    r"funded position",
+    r"بورسیه", r"فاند", r"پوزیشن", r"دکتری"
 ]
 
 EXCLUDE_PATTERNS = [
-    r"ویزای همسر", r"ویزای کاری", r"تعیین وقت سفارت", r"کلاس زبان", r"آموزش آیلتس",
-    r"ielts class", r"immigration lawyer", r"organic chemistry", r"immunotherapy",
-    r"cardiovascular", r"public policy", r"tissue staining", r"oncology"
+    # Generic irrelevant domains
+    r"ویزای همسر", r"ویزای کاری", r"تعیین وقت سفارت",
+    r"کلاس زبان", r"آموزش آیلتس",
+    r"ielts class", r"immigration lawyer",
+    
+    # Medical wet-lab / unrelated biology
+    r"wet[- ]lab", r"molecular biology",
+    r"cell culture", r"gene expression",
+    r"genomics", r"proteomics",
+    r"immunotherapy", r"oncology",
+    r"tissue staining", r"cardiovascular",
+    
+    # Chemistry / materials unrelated to AI or sensing
+    r"organic chemistry", r"inorganic chemistry",
+    r"polymer chemistry",
+    
+    # Purely unrelated robotics
+    r"robotic arm manipulation",
+    r"robot[- ]assisted surgery",
+    r"prosthetics",
+    r"exoskeleton",
+    
+    # Pure mechanical engineering
+    r"pure mechanical design",
+    r"fluid mechanics",
+    r"thermodynamics",
+    
+    # Non-relevant policy / social sciences
+    r"public policy",
+    r"social sciences",
+    r"political science"
 ]
 
 ACADEMIC_SEARCH_QUERIES = [
-    "UWB",
-    "indoor positioning",
-    "indoor localization",
-    "wireless sensing",
-    "channel state information",
+    # Direct match
+    "visual inertial odometry",
+    "visual SLAM",
+    "visual navigation",
     "sensor fusion localization",
-    "FPGA signal processing",
-    "edge AI",
-    "radar positioning"
+    "GNSS positioning",
+    "GNSS sensor fusion",
+    "robot localization",
+    "robot navigation",
+    
+    # Computer vision + robotics
+    "computer vision robotics",
+    "3D computer vision robotics",
+    "visual perception autonomous robots",
+    "visual localization",
+    "camera IMU fusion",
+    "LiDAR camera fusion",
+    
+    # Estimation / optimization
+    "factor graph optimization robotics",
+    "state estimation robotics",
+    "probabilistic robotics",
+    "pose estimation",
+    
+    # Autonomous systems
+    "autonomous navigation",
+    "field robotics",
+    "mobile robot localization",
+    "outdoor robotics",
+    
+    # Embedded / AI
+    "embedded AI robotics",
+    "edge AI computer vision",
+    "GPU accelerated computer vision",
+    "CUDA computer vision"
 ]
 
 EURAXESS_QUERIES = [
-    "UWB",
-    "indoor localization",
-    "indoor positioning",
-    "wireless sensing",
-    "RF localization",
-    "FPGA signal processing"
+    "visual inertial odometry",
+    "visual SLAM",
+    "visual navigation",
+    "sensor fusion",
+    "GNSS positioning",
+    "robot localization",
+    "robot navigation",
+    "computer vision robotics",
+    "autonomous navigation",
+    "field robotics",
+    "embedded AI"
 ]
 
 NEW_ACADEMIC_PORTALS = [
-    # jobs.ac.uk (UK Universities: Imperial, Manchester, Southampton, etc.)
+    # UK Universities
     "https://www.jobs.ac.uk/feeds/subject-areas/electrical-and-electronic-engineering",
     "https://www.jobs.ac.uk/feeds/subject-areas/computer-science",
     
-    # AcademicTransfer (Dutch Universities: TU Delft, TU Eindhoven, Twente)
-    "https://www.academictransfer.com/en/jobs/rss/?q=PhD+engineering",
-    "https://www.academictransfer.com/en/jobs/rss/?q=PhD+localization",
+    # Netherlands
+    "https://www.academictransfer.com/en/jobs/rss/?q=PhD+robotics",
+    "https://www.academictransfer.com/en/jobs/rss/?q=PhD+computer+vision",
+    "https://www.academictransfer.com/en/jobs/rss/?q=PhD+navigation",
     
-    # European / International Academic Boards
+    # European / International
     "https://academicpositions.com/feed/rss?field=computer-science-electrical-engineering",
-    "https://academicpositions.com/feed/rss?field=telecommunications-engineering"
+    "https://academicpositions.com/feed/rss?field=robotics",
+    "https://academicpositions.com/feed/rss?field=artificial-intelligence"
 ]
 
-SYSTEM_PROMPT = """You are an expert academic evaluator. Assess if a PhD vacancy post matches the candidate's research profile.
+SYSTEM_PROMPT = """You are an expert academic evaluator. Assess whether a PhD vacancy
+matches the candidate's research profile and technical background.
 
 Candidate Profile:
-- Tier 1 (Direct Match): UWB, Ultra-Wideband, indoor positioning/localization (موقعیت‌یابی داخل ساختمان), wireless sensing, RF sensing, CIR, CSI, ToF, TDoA, NLOS conditions, fingerprinting-based positioning. Combinations of localization with ML/Deep Learning.
-- Tier 2 (Adjacent): Robust wireless localization, wireless communications, signal processing (پردازش سیگنال), domain adaptation, self-supervised learning, Transformers, uncertainty estimation, GNNs, sensor fusion (UWB+IMU/Vision), Autonomous robot localization/SLAM, medical signal processing.
-- Tier 3 (Electronics/Hardware): FPGA acceleration, SDR, embedded AI, Edge AI / TinyML, low-power digital systems design, DAQ (Data Acquisition), IoT sensor networks.
-- Disqualifiers (REJECT): Pure mechanical robotics (robotic arms manipulation), prosthetics, medical wet-lab biology, pure chemistry, theoretical math without RF/sensing/signal focus, visa advertisements, language courses. (Note: Robot indoor localization/SLAM IS acceptable).
 
-Respond ONLY in valid JSON:
+Education:
+- M.Sc. Electrical Engineering (Digital Electronics), Iran University of Science and Technology
+- B.Sc. Electrical Engineering, Ferdowsi University of Mashhad
+
+Core Research Interests:
+- Visual-Inertial Odometry (VIO)
+- Visual SLAM
+- Computer Vision
+- Sensor Fusion
+- GNSS Navigation and Positioning
+- Autonomous Navigation
+- Robotics
+- Embedded AI
+
+Research / Technical Background:
+- GNSS positioning using Deep Learning and Factor Graph Optimization
+- Sensor fusion and robust localization
+- Computer vision and image processing
+- Object detection and multi-object tracking
+- Level Set medical image segmentation
+- Embedded systems and ARM microcontrollers
+- NVIDIA Jetson-oriented robotics project
+- ROS2
+- Python, C/C++, PyTorch, OpenCV
+- MATLAB
+- Git, Linux
+- VHDL / FPGA-oriented digital hardware
+- CUDA / GPU acceleration is an area of interest and ongoing development
+
+Candidate's Target Research Direction:
+The strongest target is research involving visual navigation, VIO, SLAM,
+sensor fusion, GNSS/INS integration, robot localization, autonomous navigation,
+computer vision for robotics, and perception for autonomous systems.
+
+Tier 1 — Direct Match:
+- Visual-Inertial Odometry (VIO)
+- Visual SLAM
+- Visual navigation
+- Sensor fusion for localization/navigation
+- GNSS/INS integration
+- GNSS positioning and robust localization
+- Robot localization
+- Autonomous navigation
+- Computer vision for robotics
+- LiDAR-camera-IMU fusion
+- State estimation for mobile robots
+- Factor graph optimization for robotics/navigation
+- Perception and localization for autonomous systems
+
+Tier 2 — Strongly Adjacent:
+- Computer vision
+- 3D computer vision
+- Visual perception
+- Object detection/tracking for autonomous systems
+- LiDAR perception
+- Multi-modal perception
+- Probabilistic robotics
+- Pose/trajectory estimation
+- Machine learning / deep learning for robotics
+- Self-supervised learning for visual navigation
+- Domain adaptation/generalization for perception
+- Graph neural networks for robotics
+- Uncertainty estimation
+- Autonomous vehicles
+- Field robotics
+- Mobile robotics
+- Embedded AI / Edge AI
+- CUDA/GPU acceleration for robotics or computer vision
+- ROS/ROS2
+
+Tier 3 — Relevant Hardware / Electronics:
+- Embedded systems
+- Embedded software
+- ARM / microcontrollers
+- FPGA
+- VHDL / Verilog
+- Digital hardware acceleration
+- AI accelerators
+- SDR
+- Sensor interfaces
+- Real-time systems
+
+Tier 4 — Weak/Conditional Match:
+- General machine learning
+- General deep learning
+- General image processing
+- General signal processing
+- General wireless sensing
+- General IoT
+- General autonomous systems
+
+These should receive a lower score unless the vacancy connects them to
+navigation, robotics, perception, localization, or sensor fusion.
+
+Disqualifiers — REJECT:
+- Pure mechanical engineering
+- Pure robotic manipulation / robotic arms without perception or localization
+- Prosthetics / exoskeletons unless strongly focused on sensing, perception or navigation
+- Medical wet-lab biology
+- Pure chemistry
+- Pure materials science
+- Pure theoretical mathematics
+- Pure telecommunications without sensing/localization relevance
+- Pure power electronics
+- Pure control theory with no robotics/navigation application
+- Pure software engineering with no research connection to the candidate's areas
+- Visa advertisements
+- Language courses
+
+Important Evaluation Rules:
+1. Do NOT consider a vacancy highly relevant merely because it contains
+   generic terms such as "AI", "Machine Learning", "Python", or "Robotics".
+2. Research topic and expected work are more important than the list of tools.
+3. A robotics position is a strong match if it involves localization,
+   perception, navigation, SLAM, sensor fusion, or autonomous systems.
+4. A computer vision position is a strong match if the work involves
+   robotics, navigation, localization, 3D vision, or autonomous systems.
+5. A GNSS position is a strong match even if it does not mention deep learning.
+6. An embedded/AI hardware position is relevant but secondary unless it
+   involves robotics, computer vision, or edge AI.
+7. Prefer funded PhD / doctoral research positions.
+8. Penalize positions where the candidate would need a completely different
+   research background.
+9. Do not reject a position simply because one listed technology is missing
+   from the candidate's current CV if the underlying research direction is
+   strongly aligned.
+10. Distinguish between "research fit" and "technical gap".
+
+Return ONLY valid JSON:
+
 {
   "is_relevant": true,
   "tier": 1,
   "confidence_score": 9,
-  "title": "Short title",
-  "key_topics": ["topic1", "topic2"],
-  "reason": "1-line explanation of fit"
-}"""
+  "title": "Short position title",
+  "key_topics": ["topic1", "topic2", "topic3"],
+  "research_fit": "1-line explanation of research alignment",
+  "technical_gaps": ["missing skill 1"],
+  "reason": "1-line final explanation"
+}
 
+Scoring:
+- 9-10: Excellent fit; directly aligned with target research
+- 7-8: Strong fit; closely related with manageable technical gaps
+- 5-6: Potential fit; adjacent research area
+- 3-4: Weak fit; significant mismatch
+- 0-2: Not relevant
+
+Tier:
+- Tier 1 = Direct match
+- Tier 2 = Strongly adjacent
+- Tier 3 = Hardware / embedded / electronics
+- Tier 4 = Weak / conditional
+
+If the position is clearly irrelevant:
+{
+  "is_relevant": false,
+  "tier": 4,
+  "confidence_score": 1,
+  "title": "Short position title",
+  "key_topics": [],
+  "research_fit": "No meaningful alignment with the candidate's research direction.",
+  "technical_gaps": [],
+  "reason": "Position is outside the candidate's target research areas."
+}
+"""
 def load_seen():
     if os.path.exists(SEEN_FILE):
         try:
