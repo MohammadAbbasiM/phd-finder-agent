@@ -822,6 +822,6 @@ def main():
     print("✅ Run complete. Exiting cleanly.")
 
 if __name__ == "__main__":
-    test_telegram()
-    # main()
+    # test_telegram()
+    main()
     
