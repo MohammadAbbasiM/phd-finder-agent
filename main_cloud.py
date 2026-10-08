@@ -1,34 +1,48 @@
+# ==============================================================================
+# PhD FINDER AGENT
+# Gemini Web Search + Telegram + Relevance Evaluation
+#
+# Main strategy:
+#   1. Scan Telegram academic channels
+#   2. Ask Gemini to SEARCH THE WEB for real PhD vacancies
+#   3. Prioritize FindAPhD / EURAXESS / university pages
+#   4. Extract real vacancy URLs
+#   5. Evaluate research fit against the user's profile
+#   6. Deduplicate with seen_posts.json
+#   7. Send strong matches to Telegram
+#
+# IMPORTANT:
+#   This version does NOT directly crawl FindAPhD.
+#   Gemini uses Google Search grounding instead.
+#
+# Required environment variables:
+#   GEMINI_API_KEY
+#   TG_BOT_TOKEN
+#   TG_CHAT_ID
+#
+# Optional:
+#   GEMINI_SEARCH_MODEL
+#   GEMINI_EVAL_MODEL
+# ==============================================================================
+
 import os
+import re
 import json
 import time
-import re
+import html
+import hashlib
 import warnings
-import urllib.parse
-
 from datetime import datetime, timezone, timedelta
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import requests
 import feedparser
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-warnings.filterwarnings("ignore")
-
 
 # ==============================================================================
-# OPTIONAL CLOUDSCRAPER
-# ==============================================================================
-
-try:
-    import cloudscraper
-    HAS_CLOUDSCRAPER = True
-except ImportError:
-    HAS_CLOUDSCRAPER = False
-
-
-# ==============================================================================
-# ENVIRONMENT
+# CONFIG
 # ==============================================================================
 
 load_dotenv()
@@ -45,114 +59,82 @@ CHAT_ID = (
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# --------------------------------------------------------------------------
-# Google Programmable Search / Custom Search JSON API
-#
-# Add these to GitHub Secrets:
-#
-# GOOGLE_CSE_API_KEY
-# GOOGLE_CSE_ID
-#
-# They are optional. If missing, the script will still try direct scraping.
-# --------------------------------------------------------------------------
-
-GOOGLE_CSE_API_KEY = os.getenv("GOOGLE_CSE_API_KEY")
-GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
-
-GOOGLE_CSE_ENDPOINT = (
-    "https://www.googleapis.com/customsearch/v1"
+GEMINI_SEARCH_MODEL = os.getenv(
+    "GEMINI_SEARCH_MODEL",
+    "gemini-3.5-flash-lite"
 )
 
-
-# ==============================================================================
-# DATA
-# ==============================================================================
+GEMINI_EVAL_MODEL = os.getenv(
+    "GEMINI_EVAL_MODEL",
+    "gemini-3.5-flash-lite"
+)
 
 DATA_DIR = "data"
 SEEN_FILE = os.path.join(DATA_DIR, "seen_posts.json")
 
-os.makedirs(DATA_DIR, exist_ok=True)
-
-if not os.path.exists(SEEN_FILE):
-    with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump([], f)
-
-
 MAX_POST_AGE_DAYS = 60
 
-# Telegram
-PAGES_PER_CHANNEL = 5
+TELEGRAM_PAGES_PER_CHANNEL = 5
 
-# FindAPhD direct scraping
-FINDAPHD_MAX_PAGES_PER_QUERY = 4
-FINDAPHD_MAX_RESULTS_PER_QUERY = 20
-FINDAPHD_REQUEST_DELAY = 1.2
+# Gemini web-search discovery.
+# Each task can trigger multiple Google searches internally.
+MAX_WEB_SEARCH_TASKS = 18
+MAX_RESULTS_PER_WEB_TASK = 8
 
-# Google discovery
-GOOGLE_SEARCH_RESULTS_PER_QUERY = 10
-GOOGLE_SEARCH_DELAY = 1.0
+# Small delay to avoid hammering Telegram / APIs.
+REQUEST_DELAY = 0.8
 
-# Maximum number of FindAPhD opportunities evaluated in one run.
-# This protects Gemini quota.
-FINDAPHD_MAX_CANDIDATES_PER_RUN = 60
+# Only send positions above this relevance threshold.
+TELEGRAM_MIN_CONFIDENCE = 0.72
 
-# Whether to attempt direct FindAPhD pages before switching to search.
-FINDAPHD_TRY_DIRECT = True
-
-# Once FindAPhD returns 403, stop direct scraping for the rest of this run.
-FINDAPHD_STOP_DIRECT_ON_403 = True
+# Whether to send Tier 2 positions.
+SEND_TIER_2 = True
 
 
 # ==============================================================================
-# HTTP SESSION
+# HTTP
 # ==============================================================================
 
-if HAS_CLOUDSCRAPER:
-    session = cloudscraper.create_scraper(
-        browser={
-            "browser": "chrome",
-            "platform": "linux",
-            "mobile": False
-        }
-    )
-else:
-    session = requests.Session()
+SESSION = requests.Session()
 
-
-session.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;"
-        "q=0.9,image/avif,image/webp,*/*;q=0.8"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive",
-})
+SESSION.headers.update(
+    {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/154.0.0.0 Safari/537.36"
+        )
+    }
+)
 
 
 # ==============================================================================
 # GEMINI
 # ==============================================================================
 
-from google import genai
-from google.genai import types
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None
+    types = None
 
 
-if not GEMINI_API_KEY:
-    print("[!] GEMINI_API_KEY is not configured.")
-
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
+if GEMINI_API_KEY and genai is not None:
+    try:
+        ai_client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception as exc:
+        print(f"[!] Gemini client initialization failed: {exc}")
+        ai_client = None
+else:
+    ai_client = None
 
 
 # ==============================================================================
 # TELEGRAM CHANNELS
 # ==============================================================================
 
-CHANNELS_TO_SCRAPE = [
+TELEGRAM_CHANNELS = [
     "expertapply",
     "ApplyIR2UK",
     "applyforfree",
@@ -166,503 +148,455 @@ CHANNELS_TO_SCRAPE = [
 
 
 # ==============================================================================
-# FINDAPHD CONFIGURATION
+# WEB SEARCH TASKS
 # ==============================================================================
 
-FINDAPHD_DOMAIN = "www.findaphd.com"
-
-FINDAPHD_SEARCH_URL = (
-    "https://www.findaphd.com/phds/"
-)
-
-FINDAPHD_CATEGORY_URLS = [
-    "https://www.findaphd.com/phds/engineering/?10M7o0",
-    "https://www.findaphd.com/phds/computer-science/?10M7g0",
-    "https://www.findaphd.com/phds/engineering/",
-    "https://www.findaphd.com/phds/computer-science/",
+WEB_SEARCH_TASKS = [
+    {
+        "name": "Visual-Inertial Odometry",
+        "query": (
+            "funded PhD position visual inertial odometry "
+            "VIO visual-inertial navigation"
+        ),
+    },
+    {
+        "name": "Visual SLAM",
+        "query": (
+            "funded PhD position visual SLAM "
+            "simultaneous localization mapping robotics"
+        ),
+    },
+    {
+        "name": "Visual Navigation",
+        "query": (
+            "funded PhD position visual navigation "
+            "robot navigation camera localization"
+        ),
+    },
+    {
+        "name": "Sensor Fusion",
+        "query": (
+            "funded PhD position sensor fusion "
+            "robot localization state estimation"
+        ),
+    },
+    {
+        "name": "GNSS Positioning",
+        "query": (
+            "funded PhD position GNSS positioning "
+            "GNSS localization navigation"
+        ),
+    },
+    {
+        "name": "GNSS INS",
+        "query": (
+            "funded PhD position GNSS INS "
+            "GNSS inertial navigation sensor fusion"
+        ),
+    },
+    {
+        "name": "Robot Localization",
+        "query": (
+            "funded PhD position robot localization "
+            "mobile robot state estimation"
+        ),
+    },
+    {
+        "name": "Robot Navigation",
+        "query": (
+            "funded PhD position autonomous robot navigation "
+            "robot perception localization"
+        ),
+    },
+    {
+        "name": "Computer Vision Robotics",
+        "query": (
+            "funded PhD position computer vision robotics "
+            "3D vision robot perception"
+        ),
+    },
+    {
+        "name": "LiDAR Camera Fusion",
+        "query": (
+            "funded PhD position LiDAR camera fusion "
+            "multi sensor perception robotics"
+        ),
+    },
+    {
+        "name": "Camera IMU Fusion",
+        "query": (
+            "funded PhD position camera IMU fusion "
+            "visual inertial sensor fusion"
+        ),
+    },
+    {
+        "name": "State Estimation",
+        "query": (
+            "funded PhD position state estimation robotics "
+            "factor graph optimization localization"
+        ),
+    },
+    {
+        "name": "Autonomous Navigation",
+        "query": (
+            "funded PhD position autonomous navigation "
+            "autonomous vehicles robotics"
+        ),
+    },
+    {
+        "name": "Field Robotics",
+        "query": (
+            "funded PhD position field robotics "
+            "outdoor robot localization navigation"
+        ),
+    },
+    {
+        "name": "Visual Localization",
+        "query": (
+            "funded PhD position visual localization "
+            "place recognition camera localization"
+        ),
+    },
+    {
+        "name": "Pose Estimation",
+        "query": (
+            "funded PhD position pose estimation "
+            "trajectory estimation robotics computer vision"
+        ),
+    },
+    {
+        "name": "Robotics ML",
+        "query": (
+            "funded PhD position machine learning robotics "
+            "deep learning computer vision autonomous robots"
+        ),
+    },
+    {
+        "name": "Uncertainty Robotics",
+        "query": (
+            "funded PhD position uncertainty estimation robotics "
+            "probabilistic localization sensor fusion"
+        ),
+    },
 ]
 
 
 # ==============================================================================
-# TARGETED ACADEMIC QUERIES
+# RESEARCH PROFILE
 # ==============================================================================
 
-ACADEMIC_SEARCH_QUERIES = [
+SYSTEM_PROMPT = r"""
+You are an expert PhD-position relevance evaluator.
 
-    # Tier 1
-    "visual inertial odometry",
-    "visual SLAM",
-    "visual navigation",
-    "sensor fusion localization",
-    "GNSS positioning",
-    "GNSS sensor fusion",
-    "robot localization",
-    "robot navigation",
+Candidate profile:
 
-    # Computer vision + robotics
-    "computer vision robotics",
-    "3D computer vision robotics",
-    "visual perception autonomous robots",
-    "visual localization",
-    "camera IMU fusion",
-    "LiDAR camera fusion",
-    "visual odometry",
+The candidate is an Electrical/Electronics Engineering researcher
+interested in:
 
-    # Estimation / optimization
-    "factor graph optimization robotics",
-    "state estimation robotics",
-    "probabilistic robotics",
-    "pose estimation",
-    "trajectory estimation",
+PRIMARY TARGETS
+- Visual-Inertial Odometry (VIO)
+- Visual SLAM
+- Visual Navigation
+- Visual Localization
+- Sensor Fusion
+- GNSS / INS
+- GNSS positioning
+- Robot Localization
+- Robot Navigation
+- Autonomous Navigation
+- State Estimation
+- Factor Graph Optimization
+- Computer Vision for Robotics
+- LiDAR-camera-IMU fusion
+- Multi-sensor localization
+- Autonomous vehicles
+- Field robotics
 
-    # Autonomous systems
-    "autonomous navigation",
-    "field robotics",
-    "mobile robot localization",
-    "outdoor robotics",
-    "autonomous vehicles",
+SECONDARY TARGETS
+- 3D computer vision
+- Robot perception
+- Pose estimation
+- Trajectory estimation
+- Object tracking
+- Place recognition
+- Probabilistic robotics
+- Machine learning for robotics
+- Deep learning for computer vision
+- Self-supervised learning for robotics
+- Uncertainty estimation
+- Domain adaptation
+- Graph neural networks
+- Embedded AI for robotics
+- CUDA / GPU computer vision
+- ROS / robotic systems
 
-    # ML
-    "machine learning robotics",
-    "deep learning computer vision robotics",
-    "self supervised visual navigation",
-    "uncertainty estimation robotics",
+RELEVANT TECHNICAL BACKGROUND
+- GNSS positioning
+- GNSS pseudorange correction
+- GNSS sensor fusion
+- Deep learning
+- Transformer architectures
+- Multi-task learning
+- Uncertainty-aware learning
+- Computer vision
+- Localization
+- Navigation
+- Python
+- PyTorch
+- Research-oriented engineering
 
-    # Embedded / Edge
-    "embedded AI robotics",
-    "edge AI computer vision",
-    "GPU accelerated computer vision",
-    "CUDA computer vision",
-]
+TARGET
+Direct funded PhD / fully funded PhD opportunities for Fall 2027
+or positions that can reasonably lead to a Fall 2027 PhD start.
 
+SCORING
 
-# Additional queries specifically for search-engine discovery.
-#
-# These are deliberately different from the FindAPhD internal search terms.
-# Google will search the FindAPhD index rather than requesting FindAPhD directly.
-FINDAPHD_DISCOVERY_QUERIES = [
+Tier 1:
+Directly related to:
+VIO, visual SLAM, visual navigation, visual localization,
+GNSS/INS, GNSS positioning, sensor fusion, robot localization,
+autonomous navigation, state estimation, factor graphs,
+LiDAR-camera-IMU fusion, robotics perception.
 
-    'site:findaphd.com/phds/ "visual inertial odometry"',
-    'site:findaphd.com/phds/ "visual SLAM"',
-    'site:findaphd.com/phds/ "visual navigation"',
-    'site:findaphd.com/phds/ "sensor fusion" localization',
-    'site:findaphd.com/phds/ "GNSS" positioning',
-    'site:findaphd.com/phds/ "GNSS" navigation',
-    'site:findaphd.com/phds/ "robot localization"',
-    'site:findaphd.com/phds/ "robot navigation"',
-    'site:findaphd.com/phds/ "computer vision" robotics',
-    'site:findaphd.com/phds/ "3D computer vision"',
-    'site:findaphd.com/phds/ "visual perception"',
-    'site:findaphd.com/phds/ "visual localization"',
-    'site:findaphd.com/phds/ "camera IMU"',
-    'site:findaphd.com/phds/ "LiDAR" vision',
-    'site:findaphd.com/phds/ "visual odometry"',
-    'site:findaphd.com/phds/ "factor graph" robotics',
-    'site:findaphd.com/phds/ "state estimation" robotics',
-    'site:findaphd.com/phds/ "pose estimation" robotics',
-    'site:findaphd.com/phds/ "trajectory estimation"',
-    'site:findaphd.com/phds/ "autonomous navigation"',
-    'site:findaphd.com/phds/ "field robotics"',
-    'site:findaphd.com/phds/ "mobile robot" localization',
-    'site:findaphd.com/phds/ "autonomous vehicle"',
-    'site:findaphd.com/phds/ "self-driving"',
-    'site:findaphd.com/phds/ "machine learning" robotics',
-    'site:findaphd.com/phds/ "deep learning" "computer vision"',
-    'site:findaphd.com/phds/ "uncertainty estimation" robotics',
-    'site:findaphd.com/phds/ "embedded AI" robotics',
-    'site:findaphd.com/phds/ "edge AI" robotics',
+Tier 2:
+Strongly adjacent:
+3D vision, robotics perception, pose estimation,
+trajectory estimation, autonomous vehicles,
+field robotics, probabilistic robotics,
+ML for robotics, uncertainty estimation,
+self-supervised visual learning.
 
-    # Broader queries useful for vacancies whose title is generic.
-    'site:findaphd.com/phds/ "autonomous systems" robotics',
-    'site:findaphd.com/phds/ "robot perception"',
-    'site:findaphd.com/phds/ "localization" "computer vision"',
-    'site:findaphd.com/phds/ "navigation" "computer vision"',
-]
+Tier 3:
+Technically interesting but substantially farther away.
 
+Tier 4:
+Weak relevance.
 
-# Latest PhD discovery.
-FINDAPHD_LATEST_DISCOVERY_QUERIES = [
-    'site:findaphd.com/phds/latest/ "robotics"',
-    'site:findaphd.com/phds/latest/ "computer vision"',
-    'site:findaphd.com/phds/latest/ "autonomous"',
-    'site:findaphd.com/phds/latest/ "navigation"',
-    'site:findaphd.com/phds/latest/ "sensor fusion"',
-]
+IMPORTANT:
+Do NOT reject a position merely because it does not explicitly say
+"VIO" or "SLAM".
+
+A robotics position involving localization, perception,
+multi-sensor fusion, state estimation, navigation, or 3D vision
+can be highly relevant.
+
+REJECT:
+- wet-lab biology
+- chemistry
+- materials science
+- biomedical research unrelated to robotics
+- pure mechanical design
+- prosthetics
+- social science
+- policy
+- economics
+- pure theoretical mathematics
+- positions without meaningful technical overlap
+- generic master's programs
+- generic job advertisements
+"""
 
 
 # ==============================================================================
-# KEYWORD FILTERING
+# FILTERS
 # ==============================================================================
 
 BROAD_PATTERNS = [
-
-    # VIO / SLAM / Navigation
-    r"\bv[io]\b",
-    r"visual[- ]inertial",
-    r"visual[- ]inertial odometry",
+    # VIO / SLAM
     r"\bvio\b",
+    r"visual[- ]inertial",
+    r"inertial[- ]visual",
     r"visual odometry",
-    r"visual[- ]inertial navigation",
-    r"visual navigation",
-    r"\bslam\b",
     r"visual slam",
-    r"visual[- ]inertial slam",
-    r"simultaneous localization and mapping",
-    r"localization and mapping",
-
-    # Sensor fusion
-    r"sensor fusion",
-    r"multi[- ]sensor fusion",
-    r"multimodal sensor fusion",
-    r"camera[- ]imu",
-    r"vision[- ]imu",
-    r"gnss[- ]imu",
-    r"gnss/imu",
-    r"gnss fusion",
-
-    # GNSS / positioning
-    r"\bgnss\b",
-    r"gps positioning",
-    r"gnss positioning",
-    r"satellite positioning",
-    r"robust positioning",
-    r"precise positioning",
-    r"navigation system",
-    r"localization",
-    r"positioning",
-
-    # Computer vision
-    r"computer vision",
-    r"machine vision",
-    r"3d vision",
-    r"3d computer vision",
-    r"image processing",
-    r"video processing",
-    r"object detection",
-    r"object tracking",
-    r"multi[- ]object tracking",
-    r"visual perception",
-    r"scene understanding",
-    r"depth estimation",
-    r"stereo vision",
+    r"\bslam\b",
+    r"simultaneous localization",
     r"visual localization",
-    r"place recognition",
-    r"camera[- ]based navigation",
+    r"visual navigation",
 
-    # Robotics
+    # Localization / navigation
     r"robot localization",
     r"robot navigation",
     r"autonomous navigation",
-    r"autonomous systems",
-    r"mobile robot",
-    r"mobile robotics",
-    r"field robotics",
-    r"outdoor robotics",
-    r"autonomous robot",
-    r"robot perception",
-    r"autonomous vehicle",
-    r"self[- ]driving",
-
-    # ML
-    r"machine learning",
-    r"deep learning",
-    r"neural network",
-    r"transformer",
-    r"self[- ]supervised learning",
-    r"representation learning",
-    r"domain adaptation",
-    r"domain generalization",
-    r"uncertainty estimation",
-    r"probabilistic learning",
-    r"graph neural network",
-    r"\bgnn\b",
-
-    # Estimation
-    r"factor graph",
-    r"factor graph optimization",
-    r"graph[- ]based optimization",
-    r"nonlinear optimization",
     r"state estimation",
     r"pose estimation",
     r"trajectory estimation",
-    r"kalman filter",
-    r"extended kalman",
-    r"particle filter",
-    r"probabilistic robotics",
+    r"position estimation",
+    r"localization",
+    r"navigation",
 
-    # Sensors
-    r"\bimu\b",
-    r"inertial measurement",
-    r"inertial navigation",
-    r"inertial sensing",
-    r"lidar",
-    r"lidar[- ]based",
-    r"camera[- ]lidar",
+    # Sensor fusion
+    r"sensor fusion",
+    r"multi[- ]sensor",
+    r"multisensor",
+    r"camera[- ]imu",
+    r"imu[- ]camera",
     r"lidar[- ]camera",
+    r"camera[- ]lidar",
     r"gnss",
-    r"rtk",
-    r"pseudorange",
+    r"gps",
+    r"gnss/ins",
+    r"inertial navigation",
 
-    # Embedded / Edge
-    r"embedded ai",
-    r"edge ai",
-    r"edge computing",
-    r"embedded systems",
-    r"embedded software",
-    r"embedded machine learning",
-    r"tinyml",
-    r"ai accelerator",
-    r"hardware acceleration",
-    r"gpu acceleration",
-    r"cuda",
-    r"nvidia jetson",
-    r"edge robotics",
-    r"\bros\b",
-    r"ros2",
-    r"robot operating system",
+    # Robotics / CV
+    r"robotics",
+    r"robot perception",
+    r"computer vision",
+    r"3d vision",
+    r"3d computer vision",
+    r"autonomous vehicle",
+    r"mobile robot",
+    r"field robotics",
+    r"perception",
 
-    # Hardware
-    r"\bfpga\b",
-    r"\bsdr\b",
-    r"software defined radio",
-    r"vhdl",
-    r"verilog",
-    r"digital hardware",
-    r"digital systems",
-    r"embedded hardware",
+    # Estimation / optimization
+    r"factor graph",
+    r"graph optimization",
+    r"probabilistic robotics",
+    r"kalman filter",
+    r"bayesian",
+    r"uncertainty",
 
-    # PhD signals
-    r"\bphd\b",
-    r"ph\.d",
-    r"doctoral",
-    r"phd position",
-    r"phd candidate",
-    r"doctoral position",
-    r"research assistant",
-    r"funded phd",
-    r"fully funded",
-    r"funded position",
-
-    # Persian
-    r"ناوبری",
-    r"موقعیت[- ]?یابی",
-    r"مکان[- ]?یابی",
-    r"بینایی ماشین",
-    r"بینایی کامپیوتر",
-    r"پردازش تصویر",
-    r"پردازش ویدئو",
-    r"یادگیری ماشین",
-    r"یادگیری عمیق",
-    r"ادغام سنسورها",
-    r"همجوشی سنسورها",
-    r"اسلم",
-    r"ناوبری ربات",
-    r"ربات خودران",
-    r"سیستم نهفته",
-    r"هوش مصنوعی لبه",
+    # ML
+    r"deep learning",
+    r"machine learning",
+    r"self[- ]supervised",
+    r"transformer",
+    r"graph neural",
+    r"neural network",
 ]
 
 
 EXCLUDE_PATTERNS = [
-
-    # Immigration / language
-    r"ویزای همسر",
-    r"ویزای کاری",
-    r"تعیین وقت سفارت",
-    r"کلاس زبان",
-    r"آموزش آیلتس",
-    r"ielts class",
-    r"immigration lawyer",
-
-    # Wet lab / biology
-    r"wet[- ]lab",
-    r"molecular biology",
+    # Biology / wet lab
+    r"\bbiology\b",
+    r"molecular",
     r"cell culture",
-    r"gene expression",
     r"genomics",
     r"proteomics",
-    r"immunotherapy",
-    r"oncology",
-    r"tissue staining",
-    r"cardiovascular",
+    r"wet[- ]lab",
+    r"biochemistry",
 
     # Chemistry / materials
-    r"organic chemistry",
-    r"inorganic chemistry",
-    r"polymer chemistry",
+    r"\bchemistry\b",
+    r"chemical synthesis",
+    r"polymer",
+    r"materials science",
 
-    # Mechanical / manipulation
-    r"robotic arm manipulation",
-    r"robot[- ]assisted surgery",
-    r"prosthetics",
-    r"exoskeleton",
-    r"pure mechanical design",
-    r"fluid mechanics",
-    r"thermodynamics",
+    # Mechanical / biomedical
+    r"prosthetic",
+    r"orthopedic",
+    r"biomechanical",
+    r"mechanical design",
+    r"manufacturing",
 
-    # Policy / social science
-    r"public policy",
-    r"social sciences",
-    r"political science",
+    # Nontechnical
+    r"social science",
+    r"policy",
+    r"economics",
+    r"management",
 ]
 
 
 # ==============================================================================
-# GEMINI SYSTEM PROMPT
+# UTILS
 # ==============================================================================
 
-SYSTEM_PROMPT = """You are an expert academic evaluator. Assess whether a PhD vacancy
-matches the candidate's research profile and technical background.
+def normalize_whitespace(text):
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", str(text)).strip()
 
-Candidate Profile:
 
-Education:
-- M.Sc. Electrical Engineering (Digital Electronics), Iran University of Science and Technology
-- B.Sc. Electrical Engineering, Ferdowsi University of Mashhad
+def canonicalize_url(url):
+    if not url:
+        return ""
 
-Core Research Interests:
-- Visual-Inertial Odometry (VIO)
-- Visual SLAM
-- Computer Vision
-- Sensor Fusion
-- GNSS Navigation and Positioning
-- Autonomous Navigation
-- Robotics
-- Embedded AI
+    try:
+        parsed = urlparse(url)
 
-Research / Technical Background:
-- GNSS positioning using Deep Learning and Factor Graph Optimization
-- Sensor fusion and robust localization
-- Computer vision and image processing
-- Object detection and multi-object tracking
-- Level Set medical image segmentation
-- Embedded systems and ARM microcontrollers
-- NVIDIA Jetson-oriented robotics project
-- ROS2
-- Python, C/C++, PyTorch, OpenCV
-- MATLAB
-- Git, Linux
-- VHDL / FPGA-oriented digital hardware
-- CUDA / GPU acceleration is an area of interest and ongoing development
+        # Remove tracking parameters.
+        query_items = []
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+            key_lower = key.lower()
 
-Candidate's Target Research Direction:
-The strongest target is research involving visual navigation, VIO, SLAM,
-sensor fusion, GNSS/INS integration, robot localization, autonomous navigation,
-computer vision for robotics, and perception for autonomous systems.
+            if key_lower.startswith("utm_"):
+                continue
 
-Tier 1 — Direct Match:
-- Visual-Inertial Odometry
-- Visual SLAM
-- Visual navigation
-- Sensor fusion for localization/navigation
-- GNSS/INS integration
-- GNSS positioning and robust localization
-- Robot localization
-- Autonomous navigation
-- Computer vision for robotics
-- LiDAR-camera-IMU fusion
-- State estimation for mobile robots
-- Factor graph optimization for robotics/navigation
-- Perception and localization for autonomous systems
+            if key_lower in {
+                "fbclid",
+                "gclid",
+                "ref",
+                "source",
+                "campaign",
+            }:
+                continue
 
-Tier 2 — Strongly Adjacent:
-- Computer vision
-- 3D computer vision
-- Visual perception
-- Object detection/tracking for autonomous systems
-- LiDAR perception
-- Multi-modal perception
-- Probabilistic robotics
-- Pose/trajectory estimation
-- Machine learning / deep learning for robotics
-- Self-supervised learning for visual navigation
-- Domain adaptation/generalization for perception
-- Graph neural networks for robotics
-- Uncertainty estimation
-- Autonomous vehicles
-- Field robotics
-- Mobile robotics
-- Embedded AI / Edge AI
-- CUDA/GPU acceleration for robotics or computer vision
-- ROS/ROS2
+            query_items.append((key, value))
 
-Tier 3 — Relevant Hardware / Electronics:
-- Embedded systems
-- Embedded software
-- ARM / microcontrollers
-- FPGA
-- VHDL / Verilog
-- Digital hardware acceleration
-- AI accelerators
-- SDR
-- Sensor interfaces
-- Real-time systems
+        parsed = parsed._replace(
+            query=urlencode(query_items),
+            fragment=""
+        )
 
-Tier 4 — Weak/Conditional Match:
-- General machine learning
-- General deep learning
-- General image processing
-- General signal processing
-- General wireless sensing
-- General IoT
-- General autonomous systems
+        return urlunparse(parsed)
 
-Important:
-Research topic and expected work are more important than the list of tools.
-Do not consider a vacancy highly relevant merely because it contains generic
-terms such as AI, Machine Learning, Python, or Robotics.
+    except Exception:
+        return url
 
-A robotics position is a strong match if it involves localization, perception,
-navigation, SLAM, sensor fusion, or autonomous systems.
 
-A computer vision position is a strong match if it involves robotics,
-navigation, localization, 3D vision, or autonomous systems.
+def make_uid(url, title=""):
+    raw = (
+        canonicalize_url(url).lower()
+        + "|"
+        + normalize_whitespace(title).lower()
+    )
 
-A GNSS position is a strong match even if it does not mention deep learning.
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-Prefer funded PhD / doctoral research positions.
 
-Reject:
-- Pure mechanical engineering
-- Pure robotic manipulation without perception/localization
-- Prosthetics / exoskeletons unless strongly sensing/navigation focused
-- Medical wet-lab biology
-- Pure chemistry
-- Pure materials science
-- Pure theoretical mathematics
-- Pure telecommunications without localization/sensing relevance
-- Pure power electronics
-- Pure control theory with no robotics/navigation application
-- Pure software engineering with no research connection
-- Visa advertisements
-- Language courses
+def is_recent(date_value, max_days=MAX_POST_AGE_DAYS):
+    if not date_value:
+        return True
 
-Return ONLY valid JSON:
+    try:
+        if isinstance(date_value, datetime):
+            dt = date_value
 
-{
-  "is_relevant": true,
-  "tier": 1,
-  "confidence_score": 9,
-  "title": "Short position title",
-  "key_topics": ["topic1", "topic2", "topic3"],
-  "research_fit": "1-line explanation",
-  "technical_gaps": ["missing skill 1"],
-  "reason": "1-line final explanation"
-}
+        else:
+            date_str = str(date_value)
 
-Scoring:
-9-10 = Excellent fit
-7-8 = Strong fit
-5-6 = Potential fit
-3-4 = Weak fit
-0-2 = Not relevant
+            dt = datetime.fromisoformat(
+                date_str.replace("Z", "+00:00")
+            )
 
-Tier:
-1 = Direct match
-2 = Strongly adjacent
-3 = Hardware / embedded
-4 = Weak / conditional
-"""
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        age = datetime.now(timezone.utc) - dt
+
+        return age <= timedelta(days=max_days)
+
+    except Exception:
+        return True
+
+
+def text_matches_research(text):
+    text = normalize_whitespace(text).lower()
+
+    positive = any(
+        re.search(pattern, text, flags=re.I)
+        for pattern in BROAD_PATTERNS
+    )
+
+    if not positive:
+        return False
+
+    excluded = any(
+        re.search(pattern, text, flags=re.I)
+        for pattern in EXCLUDE_PATTERNS
+    )
+
+    return not excluded
 
 
 # ==============================================================================
@@ -670,2652 +604,922 @@ Tier:
 # ==============================================================================
 
 def load_seen():
-    if os.path.exists(SEEN_FILE):
-        try:
-            with open(SEEN_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f))
-        except Exception:
-            pass
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    if not os.path.exists(SEEN_FILE):
+        return set()
+
+    try:
+        with open(SEEN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if isinstance(data, list):
+            return set(data)
+
+        if isinstance(data, dict):
+            return set(data.keys())
+
+    except Exception as exc:
+        print(f"[!] Could not load seen database: {exc}")
 
     return set()
 
 
-def mark_as_seen(uid: str, seen: set):
-    if not uid:
-        return
-
-    seen.add(uid)
+def save_seen(seen):
+    os.makedirs(DATA_DIR, exist_ok=True)
 
     try:
         with open(SEEN_FILE, "w", encoding="utf-8") as f:
             json.dump(
-                sorted(list(seen)),
+                sorted(seen),
                 f,
                 ensure_ascii=False,
                 indent=2
             )
-    except Exception as e:
-        print(f"[!] Could not save seen database: {e}")
+    except Exception as exc:
+        print(f"[!] Could not save seen database: {exc}")
+
+
+def mark_as_seen(seen, uid):
+    seen.add(uid)
 
 
 # ==============================================================================
-# GENERAL HELPERS
+# GEMINI JSON EXTRACTION
 # ==============================================================================
 
-def normalize_whitespace(text: str) -> str:
+def extract_json(text):
     if not text:
-        return ""
-
-    return re.sub(r"\s+", " ", str(text)).strip()
-
-
-def canonicalize_url(url: str) -> str:
-    if not url:
-        return ""
-
-    url = url.strip()
-
-    parsed = urlparse(url)
-
-    parsed = parsed._replace(fragment="")
-
-    query = parse_qs(
-        parsed.query,
-        keep_blank_values=True
-    )
-
-    tracking_prefixes = (
-        "utm_",
-        "fbclid",
-        "gclid",
-        "ref",
-        "source"
-    )
-
-    clean_query = {}
-
-    for key, values in query.items():
-
-        if key.lower().startswith(tracking_prefixes):
-            continue
-
-        clean_query[key] = values
-
-    new_query = urlencode(
-        clean_query,
-        doseq=True
-    )
-
-    parsed = parsed._replace(
-        query=new_query
-    )
-
-    result = urlunparse(parsed)
-
-    if (
-        result.endswith("/")
-        and parsed.path not in ("", "/")
-    ):
-        result = result[:-1]
-
-    return result
-
-
-def make_findaphd_uid(
-    url: str,
-    title: str = ""
-) -> str:
-
-    canonical = canonicalize_url(url)
-
-    if canonical:
-        return canonical
-
-    return (
-        "findaphd:"
-        + normalize_whitespace(title).lower()
-    )
-
-
-# ==============================================================================
-# FILTERING
-# ==============================================================================
-
-def contains_excluded_pattern(text: str) -> bool:
-
-    lower_t = text.lower()
-
-    return any(
-        re.search(pattern, lower_t)
-        for pattern in EXCLUDE_PATTERNS
-    )
-
-
-def keyword_score(text: str) -> int:
-
-    lower_t = text.lower()
-
-    return sum(
-        1
-        for pattern in BROAD_PATTERNS
-        if re.search(pattern, lower_t)
-    )
-
-
-def fast_prefilter(text: str) -> bool:
-
-    if not text:
-        return False
-
-    if contains_excluded_pattern(text):
-        return False
-
-    return keyword_score(text) > 0
-
-
-def findaphd_soft_prefilter(
-    title: str,
-    description: str
-) -> bool:
-
-    text = f"{title}\n{description}"
-
-    if contains_excluded_pattern(text):
-        return False
-
-    strong_patterns = [
-        r"visual",
-        r"robot",
-        r"autonomous",
-        r"navigation",
-        r"localization",
-        r"localisation",
-        r"slam",
-        r"odometry",
-        r"sensor fusion",
-        r"computer vision",
-        r"perception",
-        r"gnss",
-        r"gps",
-        r"lidar",
-        r"inertial",
-        r"imu",
-        r"positioning",
-        r"mobile robotics",
-        r"machine learning",
-        r"deep learning",
-        r"3d vision",
-        r"autonomous vehicle",
-        r"self[- ]driving",
-        r"embedded ai",
-    ]
-
-    lower_text = text.lower()
-
-    return any(
-        re.search(pattern, lower_text)
-        for pattern in strong_patterns
-    )
-
-
-# ==============================================================================
-# DATE HELPERS
-# ==============================================================================
-
-def is_recent_date(dt_obj) -> bool:
-
-    if not dt_obj:
-        return True
-
-    try:
-
-        now = datetime.now(timezone.utc)
-
-        if dt_obj.tzinfo is None:
-            dt_obj = dt_obj.replace(
-                tzinfo=timezone.utc
-            )
-
-        return (
-            now - dt_obj
-        ) <= timedelta(
-            days=MAX_POST_AGE_DAYS
-        )
-
-    except Exception:
-        return True
-
-
-def parse_iso_time(time_str: str):
-
-    try:
-
-        return datetime.fromisoformat(
-            time_str.replace(
-                "Z",
-                "+00:00"
-            )
-        )
-
-    except Exception:
         return None
 
+    text = text.strip()
 
-# ==============================================================================
-# GEMINI JSON
-# ==============================================================================
-
-def extract_clean_json(
-    raw_text: str
-) -> dict:
-
-    if not raw_text:
-        return {
-            "is_relevant": False,
-            "reason": "Empty Gemini response"
-        }
-
+    # Direct JSON
     try:
-
-        start_idx = raw_text.find("{")
-        end_idx = raw_text.rfind("}")
-
-        if (
-            start_idx != -1
-            and end_idx != -1
-            and end_idx >= start_idx
-        ):
-
-            return json.loads(
-                raw_text[
-                    start_idx:end_idx + 1
-                ]
-            )
-
+        return json.loads(text)
     except Exception:
         pass
 
-    return {
-        "is_relevant": False,
-        "reason": "Failed to parse JSON output"
-    }
+    # ```json ... ```
+    match = re.search(
+        r"```(?:json)?\s*(.*?)\s*```",
+        text,
+        flags=re.I | re.S
+    )
+
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except Exception:
+            pass
+
+    # First object
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start >= 0 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except Exception:
+            pass
+
+    return None
 
 
-def evaluate_with_gemini(
-    text: str
-) -> dict:
+# ==============================================================================
+# GEMINI WEB RESEARCHER
+# ==============================================================================
 
-    if not GEMINI_API_KEY:
+def gemini_web_search(task_name, search_query):
+    """
+    Ask Gemini to search the live web using Google's Search grounding.
+
+    The model itself performs the searches.
+    We request structured vacancy records.
+    """
+
+    if ai_client is None:
+        print("  [!] Gemini client unavailable.")
+        return []
+
+    prompt = f"""
+You are a PhD vacancy research agent.
+
+Today's date is {datetime.now().date()}.
+
+Find CURRENT and REAL PhD vacancy/project opportunities related to:
+
+{task_name}
+
+Search query:
+{search_query}
+
+SEARCH STRATEGY
+---------------
+Search the live web.
+
+Prioritize:
+1. FindAPhD
+2. EURAXESS
+3. Official university PhD vacancy pages
+4. Official research group / laboratory pages
+5. Reputable academic job boards
+
+IMPORTANT:
+- Search specifically for actual PhD vacancies.
+- Prefer funded / fully funded positions.
+- Prefer positions accepting international applicants.
+- Prefer positions relevant to Fall 2027 or currently open positions
+  that could plausibly start around 2027.
+- Do NOT return generic university pages.
+- Do NOT return generic search result pages.
+- Do NOT return articles about PhD opportunities.
+- Do NOT invent vacancies.
+- Only include a position when you can identify a real source URL.
+- If the deadline is unknown, use null.
+- If funding is unknown, use null.
+- If supervisor is unknown, use null.
+
+For each candidate, extract:
+- exact project title
+- university
+- country
+- supervisor if available
+- deadline if available
+- funding information
+- source website
+- actual vacancy/project URL
+- concise project description
+- why it appears relevant to the research topic
+
+Return ONLY valid JSON:
+
+{{
+  "positions": [
+    {{
+      "title": "...",
+      "university": "...",
+      "country": "...",
+      "supervisor": null,
+      "deadline": null,
+      "funding": null,
+      "source": "...",
+      "url": "...",
+      "description": "...",
+      "relevance": "..."
+    }}
+  ]
+}}
+
+Return at most {MAX_RESULTS_PER_WEB_TASK} positions.
+"""
+
+    try:
+        grounding_tool = types.Tool(
+            google_search=types.GoogleSearch()
+        )
+
+        config = types.GenerateContentConfig(
+            tools=[grounding_tool],
+            temperature=0.1,
+        )
+
+        response = ai_client.models.generate_content(
+            model=GEMINI_SEARCH_MODEL,
+            contents=prompt,
+            config=config,
+        )
+
+        text = getattr(response, "text", None)
+
+        if not text:
+            print("  [!] Gemini returned empty response.")
+            return []
+
+        data = extract_json(text)
+
+        if not isinstance(data, dict):
+            print("  [!] Gemini returned invalid JSON.")
+            return []
+
+        positions = data.get("positions", [])
+
+        if not isinstance(positions, list):
+            return []
+
+        return positions
+
+    except Exception as exc:
+        print(f"  [!] Gemini web search failed: {exc}")
+        return []
+
+
+# ==============================================================================
+# GEMINI RELEVANCE EVALUATOR
+# ==============================================================================
+
+def evaluate_with_gemini(position):
+    if ai_client is None:
+        return {
+            "is_relevant": False,
+            "tier": 4,
+            "confidence_score": 0.0,
+            "reason": "Gemini unavailable.",
+            "_api_ok": False,
+        }
+
+    title = normalize_whitespace(position.get("title"))
+    description = normalize_whitespace(position.get("description"))
+    relevance = normalize_whitespace(position.get("relevance"))
+    university = normalize_whitespace(position.get("university"))
+    source = normalize_whitespace(position.get("source"))
+    url = normalize_whitespace(position.get("url"))
+
+    prompt = f"""
+{SYSTEM_PROMPT}
+
+Evaluate this PhD opportunity.
+
+TITLE:
+{title}
+
+UNIVERSITY:
+{university}
+
+SOURCE:
+{source}
+
+URL:
+{url}
+
+DESCRIPTION:
+{description}
+
+DISCOVERY AGENT'S RELEVANCE NOTE:
+{relevance}
+
+Return ONLY JSON:
+
+{{
+  "is_relevant": true,
+  "tier": 1,
+  "confidence_score": 0.95,
+  "title": "...",
+  "key_topics": ["...", "..."],
+  "research_fit": "...",
+  "technical_gaps": ["...", "..."],
+  "reason": "..."
+}}
+
+Rules:
+- confidence_score must be between 0 and 1.
+- tier must be 1, 2, 3, or 4.
+- Tier 1 is the strongest match.
+- Tier 2 is a good adjacent match.
+- Do not inflate relevance merely because the position says "AI".
+"""
+
+    try:
+        response = ai_client.models.generate_content(
+            model=GEMINI_EVAL_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+            ),
+        )
+
+        data = extract_json(
+            getattr(response, "text", "")
+        )
+
+        if not isinstance(data, dict):
+            return {
+                "is_relevant": False,
+                "tier": 4,
+                "confidence_score": 0.0,
+                "reason": "Invalid Gemini evaluation.",
+                "_api_ok": False,
+            }
+
+        data["_api_ok"] = True
+
+        return data
+
+    except Exception as exc:
+        print(f"  [!] Gemini evaluation failed: {exc}")
 
         return {
             "is_relevant": False,
-            "reason": "GEMINI_API_KEY missing"
+            "tier": 4,
+            "confidence_score": 0.0,
+            "reason": str(exc),
+            "_api_ok": False,
         }
 
-    models_to_try = [
-        "gemini-3.1-flash-lite",
-        "gemini-3.5-flash-lite"
-    ]
-
-    for attempt in range(3):
-
-        for model_name in models_to_try:
-
-            try:
-
-                response = (
-                    ai_client.models.generate_content(
-                        model=model_name,
-                        contents=(
-                            "Evaluate this PhD post:\n\n"
-                            f"{text[:7000]}"
-                        ),
-                        config=types.GenerateContentConfig(
-                            system_instruction=SYSTEM_PROMPT,
-                            temperature=0.1,
-                        )
-                    )
-                )
-
-                time.sleep(4.2)
-
-                if (
-                    not response.candidates
-                    or not response.candidates[0].content.parts
-                ):
-
-                    return {
-                        "is_relevant": False,
-                        "reason": (
-                            "Blocked by Gemini "
-                            "Safety Filters"
-                        )
-                    }
-
-                return extract_clean_json(
-                    response.text
-                )
-
-            except Exception as e:
-
-                err_str = str(e)
-
-                if (
-                    "429" in err_str
-                    or "RESOURCE_EXHAUSTED"
-                    in err_str
-                ):
-
-                    print(
-                        "[!] Gemini rate limit. "
-                        "Waiting 25 seconds..."
-                    )
-
-                    time.sleep(25)
-
-                    break
-
-                print(
-                    f"[!] Gemini error "
-                    f"({model_name}): "
-                    f"{err_str[:180]}"
-                )
-
-                continue
-
-    return {
-        "is_relevant": False,
-        "reason": "API error after retries"
-    }
-
 
 # ==============================================================================
-# TELEGRAM ALERT
+# TELEGRAM
 # ==============================================================================
 
-def send_alert(
-    url: str,
-    analysis: dict,
-    snippet: str
-):
-
-    if not isinstance(analysis, dict):
+def send_telegram_message(text):
+    if not BOT_TOKEN or not CHAT_ID:
+        print("  [!] Telegram credentials not configured.")
         return False
 
-    tier_badges = {
-        1: "🔥 Tier 1",
-        2: "⚡ Tier 2",
-        3: "🛠 Tier 3"
-    }
-
-    tier_val = analysis.get(
-        "tier",
-        2
-    )
-
-    label = tier_badges.get(
-        tier_val,
-        "Relevant Opportunity"
-    )
-
-    score = analysis.get(
-        "confidence_score",
-        "N/A"
-    )
-
-    title = analysis.get(
-        "title",
-        "PhD Opportunity"
-    )
-
-    topics_list = analysis.get(
-        "key_topics",
-        []
-    )
-
-    topics = (
-        ", ".join(topics_list)
-        if isinstance(topics_list, list)
-        else str(topics_list)
-    )
-
-    reason = analysis.get(
-        "reason",
-        "Matches research profile."
-    )
-
-    msg = (
-        f"🎯 <b>New PhD Match!</b>\n"
-        f"<b>Category:</b> {label}\n"
-        f"<b>Score:</b> {score}/10\n"
-        f"<b>Title:</b> {title}\n"
-        f"<b>Topics:</b> <code>{topics}</code>\n\n"
-        f"💡 <b>Reason:</b> {reason}\n\n"
-        f'🔗 <a href="{url}">Open Vacancy / Post</a>\n'
-        f"────────────────────\n"
-        f"📝 <b>Preview:</b>\n"
-        f"{snippet[:700]}..."
-    )
-
-    endpoint = (
-        "https://api.telegram.org/bot"
+    url = (
+        f"https://api.telegram.org/bot"
         f"{BOT_TOKEN}/sendMessage"
     )
 
     payload = {
         "chat_id": CHAT_ID,
-        "text": msg,
+        "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": False
+        "disable_web_page_preview": False,
     }
 
     try:
-
-        response = session.post(
-            endpoint,
+        response = SESSION.post(
+            url,
             json=payload,
-            timeout=20
-        )
-
-        print(
-            f"[Telegram] HTTP "
-            f"{response.status_code}"
+            timeout=20,
         )
 
         if response.status_code != 200:
-
             print(
-                "[-] Telegram failed!"
+                f"  [!] Telegram HTTP {response.status_code}: "
+                f"{response.text[:300]}"
             )
-
             return False
-
-        result = response.json()
-
-        if not result.get("ok"):
-
-            print(
-                f"[-] Telegram API error: "
-                f"{result}"
-            )
-
-            return False
-
-        print(
-            "[+] Telegram alert sent successfully."
-        )
 
         return True
 
-    except Exception as e:
-
-        print(
-            f"[-] Alert sending error: {e}"
-        )
-
+    except Exception as exc:
+        print(f"  [!] Telegram error: {exc}")
         return False
 
 
-# ==============================================================================
-# TELEGRAM SCRAPER
-# ==============================================================================
-
-def scrape_telegram_channel_deep(
-    channel: str,
-    seen: set
-):
-
-    print(
-        f"\n📡 Scanning @{channel}..."
+def format_position_alert(position, evaluation):
+    title = html.escape(
+        normalize_whitespace(
+            position.get("title") or evaluation.get("title")
+        )
     )
 
-    current_url = (
+    university = html.escape(
+        normalize_whitespace(position.get("university"))
+        or "Unknown"
+    )
+
+    country = html.escape(
+        normalize_whitespace(position.get("country"))
+        or "Unknown"
+    )
+
+    supervisor = html.escape(
+        normalize_whitespace(position.get("supervisor"))
+        or "Not specified"
+    )
+
+    deadline = html.escape(
+        normalize_whitespace(position.get("deadline"))
+        or "Not specified"
+    )
+
+    funding = html.escape(
+        normalize_whitespace(position.get("funding"))
+        or "Not specified"
+    )
+
+    source = html.escape(
+        normalize_whitespace(position.get("source"))
+        or "Web"
+    )
+
+    url = canonicalize_url(position.get("url", ""))
+
+    tier = evaluation.get("tier", 4)
+
+    confidence = evaluation.get(
+        "confidence_score",
+        0.0
+    )
+
+    reason = html.escape(
+        normalize_whitespace(
+            evaluation.get("reason")
+        )
+    )
+
+    topics = evaluation.get(
+        "key_topics",
+        []
+    )
+
+    if not isinstance(topics, list):
+        topics = []
+
+    topics_text = ", ".join(
+        html.escape(str(x))
+        for x in topics[:8]
+    )
+
+    description = html.escape(
+        normalize_whitespace(
+            position.get("description")
+        )
+    )
+
+    if len(description) > 700:
+        description = description[:700] + "..."
+
+    return (
+        "🚀 <b>PhD POSITION FOUND</b>\n"
+        "\n"
+        f"<b>{title}</b>\n"
+        f"🏫 {university}\n"
+        f"🌍 {country}\n"
+        f"🎓 Tier: <b>{tier}</b>\n"
+        f"📊 Confidence: <b>{confidence:.2f}</b>\n"
+        "\n"
+        f"👤 Supervisor: {supervisor}\n"
+        f"💰 Funding: {funding}\n"
+        f"⏰ Deadline: {deadline}\n"
+        f"🔎 Source: {source}\n"
+        "\n"
+        f"🧠 <b>Topics:</b> {topics_text}\n"
+        "\n"
+        f"📝 {description}\n"
+        "\n"
+        f"🎯 <b>Why relevant:</b> {reason}\n"
+        "\n"
+        f"🔗 <a href=\"{html.escape(url, quote=True)}\">"
+        f"Open position</a>"
+    )
+
+
+# ==============================================================================
+# PROCESS A POSITION
+# ==============================================================================
+
+def process_position(position, seen):
+    url = canonicalize_url(
+        position.get("url", "")
+    )
+
+    title = normalize_whitespace(
+        position.get("title")
+    )
+
+    if not url:
+        print("    [-] No URL.")
+        return False
+
+    if not title:
+        print("    [-] No title.")
+        return False
+
+    uid = make_uid(url, title)
+
+    if uid in seen:
+        print("    [=] Already seen.")
+        return False
+
+    # Basic sanity filter before expensive Gemini evaluation.
+    combined_text = " ".join(
+        [
+            title,
+            normalize_whitespace(position.get("description")),
+            normalize_whitespace(position.get("relevance")),
+        ]
+    )
+
+    if not text_matches_research(combined_text):
+        print("    [-] Weak keyword match.")
+        return False
+
+    print(
+        f"    🧠 Evaluating: "
+        f"{title[:100]}"
+    )
+
+    evaluation = evaluate_with_gemini(position)
+
+    if not evaluation.get("_api_ok"):
+        # IMPORTANT:
+        # Do not mark as seen when Gemini failed.
+        return False
+
+    is_relevant = bool(
+        evaluation.get("is_relevant", False)
+    )
+
+    tier = int(
+        evaluation.get("tier", 4)
+    )
+
+    try:
+        confidence = float(
+            evaluation.get(
+                "confidence_score",
+                0
+            )
+        )
+    except Exception:
+        confidence = 0.0
+
+    if not is_relevant:
+        print(
+            f"    [-] Rejected | "
+            f"Tier {tier} | "
+            f"{confidence:.2f}"
+        )
+
+        mark_as_seen(seen, uid)
+        return False
+
+    if tier > 2:
+        print(
+            f"    [-] Tier {tier} "
+            f"(below threshold)"
+        )
+
+        mark_as_seen(seen, uid)
+        return False
+
+    if confidence < TELEGRAM_MIN_CONFIDENCE:
+        print(
+            f"    [-] Confidence "
+            f"{confidence:.2f} < "
+            f"{TELEGRAM_MIN_CONFIDENCE}"
+        )
+
+        mark_as_seen(seen, uid)
+        return False
+
+    if tier == 2 and not SEND_TIER_2:
+        mark_as_seen(seen, uid)
+        return False
+
+    print(
+        f"    [✓] MATCH | "
+        f"Tier {tier} | "
+        f"confidence={confidence:.2f}"
+    )
+
+    alert = format_position_alert(
+        position,
+        evaluation
+    )
+
+    sent = send_telegram_message(alert)
+
+    # Mark as seen after successful processing.
+    # Even if Telegram fails, the position has been evaluated.
+    mark_as_seen(seen, uid)
+
+    if sent:
+        print("    [✓] Telegram alert sent.")
+
+    return True
+
+
+# ==============================================================================
+# GEMINI WEB DISCOVERY
+# ==============================================================================
+
+def scrape_with_gemini(seen):
+    print("=" * 70)
+    print("🌐 GEMINI WEB RESEARCHER")
+    print("=" * 70)
+
+    if ai_client is None:
+        print()
+        print("[!] Gemini is not configured.")
+        print("    Add GEMINI_API_KEY to GitHub Secrets.")
+        print()
+        return
+
+    total_discovered = 0
+    total_matches = 0
+
+    tasks = WEB_SEARCH_TASKS[:MAX_WEB_SEARCH_TASKS]
+
+    for index, task in enumerate(tasks, start=1):
+
+        print()
+        print(
+            f"🔎 [{index}/{len(tasks)}] "
+            f"{task['name']}"
+        )
+
+        print(
+            f"    Query: {task['query']}"
+        )
+
+        positions = gemini_web_search(
+            task["name"],
+            task["query"]
+        )
+
+        print(
+            f"    [>] Gemini returned "
+            f"{len(positions)} candidates."
+        )
+
+        total_discovered += len(positions)
+
+        for position in positions:
+
+            # Force source/task metadata.
+            if not position.get("source"):
+                position["source"] = (
+                    "Gemini Web Search"
+                )
+
+            if not position.get("discovered_topic"):
+                position["discovered_topic"] = (
+                    task["name"]
+                )
+
+            url = canonicalize_url(
+                position.get("url", "")
+            )
+
+            if not url:
+                print("    [-] Candidate without URL.")
+                continue
+
+            # Ensure it really looks like a web page.
+            parsed = urlparse(url)
+
+            if parsed.scheme not in {
+                "http",
+                "https",
+            }:
+                print("    [-] Invalid URL.")
+                continue
+
+            if process_position(
+                position,
+                seen
+            ):
+                total_matches += 1
+
+            time.sleep(REQUEST_DELAY)
+
+        time.sleep(REQUEST_DELAY)
+
+    print()
+    print(
+        f"[✓] Gemini discovered: "
+        f"{total_discovered}"
+    )
+
+    print(
+        f"[✓] Relevant matches: "
+        f"{total_matches}"
+    )
+
+
+# ==============================================================================
+# TELEGRAM CHANNEL SCRAPER
+# ==============================================================================
+
+def extract_telegram_messages(html_text):
+    soup = BeautifulSoup(
+        html_text,
+        "html.parser"
+    )
+
+    messages = []
+
+    for wrapper in soup.select(
+        ".tgme_widget_message_wrap"
+    ):
+        text_node = wrapper.select_one(
+            ".tgme_widget_message_text"
+        )
+
+        if not text_node:
+            continue
+
+        text = normalize_whitespace(
+            text_node.get_text(" ", strip=True)
+        )
+
+        if not text:
+            continue
+
+        time_node = wrapper.select_one(
+            "time"
+        )
+
+        date_value = None
+
+        if time_node:
+            date_value = (
+                time_node.get("datetime")
+                or time_node.get("title")
+            )
+
+        link_node = wrapper.select_one(
+            ".tgme_widget_message_date"
+        )
+
+        url = ""
+
+        if link_node:
+            url = link_node.get("href", "")
+
+        messages.append(
+            {
+                "text": text,
+                "date": date_value,
+                "url": url,
+            }
+        )
+
+    return messages
+
+
+def scrape_telegram_channel(
+    channel,
+    seen
+):
+    print(
+        f"📡 Scanning @{channel}..."
+    )
+
+    base_url = (
         f"https://t.me/s/{channel}"
     )
 
+    all_messages = []
+
+    before = None
+
     for _ in range(
-        PAGES_PER_CHANNEL
+        TELEGRAM_PAGES_PER_CHANNEL
     ):
 
-        try:
+        url = base_url
 
-            r = session.get(
-                current_url,
-                timeout=25
+        if before:
+            url += f"?before={before}"
+
+        try:
+            response = SESSION.get(
+                url,
+                timeout=20
             )
 
-            if r.status_code != 200:
-
+            if response.status_code != 200:
                 print(
-                    f"[-] Telegram HTTP "
-                    f"{r.status_code}"
+                    f"    [-] HTTP "
+                    f"{response.status_code}"
                 )
-
                 break
 
-            soup = BeautifulSoup(
-                r.text,
-                "html.parser"
-            )
-
-            messages = soup.find_all(
-                "div",
-                class_="tgme_widget_message"
+            messages = extract_telegram_messages(
+                response.text
             )
 
             if not messages:
                 break
 
-            oldest_id_on_page = None
+            all_messages.extend(messages)
 
-            for msg in reversed(messages):
+            # Telegram message IDs are encoded
+            # in the href.
+            ids = []
 
-                msg_id = msg.get(
-                    "data-post"
-                )
-
-                if not msg_id:
-                    continue
-
-                raw_num = (
-                    msg_id.split("/")[-1]
-                )
-
-                if raw_num.isdigit():
-
-                    oldest_id_on_page = (
-                        int(raw_num)
-                        if oldest_id_on_page is None
-                        else min(
-                            oldest_id_on_page,
-                            int(raw_num)
-                        )
-                    )
-
-                if msg_id in seen:
-                    continue
-
-                time_tag = msg.find("time")
-
-                if (
-                    time_tag
-                    and time_tag.get("datetime")
-                ):
-
-                    dt = parse_iso_time(
-                        time_tag.get(
-                            "datetime"
-                        )
-                    )
-
-                    if (
-                        dt
-                        and not is_recent_date(dt)
-                    ):
-
-                        mark_as_seen(
-                            msg_id,
-                            seen
-                        )
-
-                        continue
-
-                text_elem = msg.find(
-                    "div",
-                    class_="tgme_widget_message_text"
-                )
-
-                if not text_elem:
-
-                    mark_as_seen(
-                        msg_id,
-                        seen
-                    )
-
-                    continue
-
-                text = text_elem.get_text(
-                    separator="\n"
-                ).strip()
-
-                if (
-                    len(text) < 40
-                    or not fast_prefilter(text)
-                ):
-
-                    mark_as_seen(
-                        msg_id,
-                        seen
-                    )
-
-                    continue
-
-                print(
-                    f"[+] Evaluating Telegram post: "
-                    f"{msg_id}"
-                )
-
-                analysis = evaluate_with_gemini(
-                    text
-                )
-
-                if analysis.get(
-                    "is_relevant"
-                ):
-
-                    send_alert(
-                        f"https://t.me/{msg_id}",
-                        analysis,
-                        text
-                    )
-
-                    print(
-                        "    [✓] MATCH CONFIRMED "
-                        f"(Tier {analysis.get('tier')} - "
-                        f"Score "
-                        f"{analysis.get('confidence_score')}/10)"
-                    )
-
-                else:
-
-                    print(
-                        "    [-] Skipped: "
-                        f"{analysis.get('reason', 'LLM filter')}"
-                    )
-
-                mark_as_seen(
-                    msg_id,
-                    seen
-                )
-
-            if oldest_id_on_page:
-
-                current_url = (
-                    f"https://t.me/s/{channel}"
-                    f"?before={oldest_id_on_page}"
-                )
-
-            else:
-                break
-
-        except Exception as e:
-
-            print(
-                f"[-] @{channel} issue: {e}"
-            )
-
-            break
-
-
-# ==============================================================================
-# FINDAPHD URL HELPERS
-# ==============================================================================
-
-def build_findaphd_search_url(
-    keyword: str,
-    page: int = 1
-) -> str:
-
-    params = {
-        "Keywords": keyword
-    }
-
-    if page > 1:
-        params["Page"] = page
-
-    return (
-        FINDAPHD_SEARCH_URL
-        + "?"
-        + urllib.parse.urlencode(params)
-    )
-
-
-def build_findaphd_category_url(
-    base_url: str,
-    page: int
-) -> str:
-
-    if page <= 1:
-        return base_url
-
-    parsed = urlparse(base_url)
-
-    query = parse_qs(
-        parsed.query,
-        keep_blank_values=True
-    )
-
-    query["Page"] = [str(page)]
-
-    new_query = urlencode(
-        query,
-        doseq=True
-    )
-
-    return urlunparse(
-        parsed._replace(
-            query=new_query
-        )
-    )
-
-
-def is_findaphd_vacancy_url(
-    url: str
-) -> bool:
-
-    if not url:
-        return False
-
-    parsed = urlparse(url)
-
-    if (
-        "findaphd.com"
-        not in parsed.netloc.lower()
-    ):
-        return False
-
-    path = parsed.path.lower()
-
-    if path in (
-        "",
-        "/",
-        "/phds",
-        "/phds/"
-    ):
-        return False
-
-    if not path.startswith(
-        "/phds/"
-    ):
-        return False
-
-    remaining = path[
-        len("/phds/"):
-    ]
-
-    # Search/category pages usually don't have
-    # another path segment.
-    if "/" not in remaining:
-        return False
-
-    bad_prefixes = [
-        "/phds/engineering",
-        "/phds/computer-science",
-        "/phds/discipline",
-        "/phds/latest",
-        "/phds/subject",
-        "/phds/universities",
-    ]
-
-    if any(
-        path.startswith(p)
-        for p in bad_prefixes
-    ):
-        return False
-
-    return True
-
-
-# ==============================================================================
-# FINDAPHD LISTING PARSER
-# ==============================================================================
-
-def extract_findaphd_listing_links(
-    soup: BeautifulSoup,
-    base_url: str
-):
-
-    results = {}
-
-    for a in soup.find_all(
-        "a",
-        href=True
-    ):
-
-        href = a.get(
-            "href",
-            ""
-        ).strip()
-
-        if not href:
-            continue
-
-        absolute_url = canonicalize_url(
-            urljoin(
-                base_url,
-                href
-            )
-        )
-
-        if not is_findaphd_vacancy_url(
-            absolute_url
-        ):
-            continue
-
-        title = normalize_whitespace(
-            a.get_text(
-                " ",
-                strip=True
-            )
-        )
-
-        if len(title) < 10:
-            continue
-
-        navigation_words = {
-            "view",
-            "apply",
-            "more",
-            "details",
-            "read more",
-            "view project",
-            "view phd",
-            "see all",
-        }
-
-        if title.lower() in navigation_words:
-            continue
-
-        results.setdefault(
-            absolute_url,
-            {
-                "url": absolute_url,
-                "anchor_title": title
-            }
-        )
-
-    return list(
-        results.values()
-    )
-
-
-def extract_findaphd_card_for_link(
-    soup: BeautifulSoup,
-    link: str
-):
-
-    canonical_link = canonicalize_url(
-        link
-    )
-
-    anchor = None
-
-    for a in soup.find_all(
-        "a",
-        href=True
-    ):
-
-        candidate = canonicalize_url(
-            urljoin(
-                "https://www.findaphd.com",
-                a.get("href", "")
-            )
-        )
-
-        if candidate == canonical_link:
-
-            anchor = a
-            break
-
-    if not anchor:
-        return ""
-
-    parent = anchor
-
-    for _ in range(6):
-
-        parent = parent.parent
-
-        if not parent:
-            break
-
-        text = normalize_whitespace(
-            parent.get_text(
-                " ",
-                strip=True
-            )
-        )
-
-        if 80 <= len(text) <= 5000:
-
-            if (
-                len(parent.find_all("a")) >= 2
-                or parent.find(
-                    ["h1", "h2", "h3", "h4"]
-                )
-            ):
-                return text
-
-    return normalize_whitespace(
-        anchor.parent.get_text(
-            " ",
-            strip=True
-        )
-    )
-
-
-# ==============================================================================
-# FINDAPHD DIRECT DETAIL PAGE
-# ==============================================================================
-
-def parse_findaphd_detail_page(
-    url: str
-) -> dict:
-
-    result = {
-        "title": "",
-        "description": "",
-        "university": "",
-        "location": "",
-        "funding": "",
-        "deadline": "",
-    }
-
-    try:
-
-        response = session.get(
-            url,
-            timeout=25
-        )
-
-        if response.status_code != 200:
-
-            print(
-                f"    [-] Detail HTTP "
-                f"{response.status_code}"
-            )
-
-            return result
-
-        soup = BeautifulSoup(
-            response.text,
-            "html.parser"
-        )
-
-        title_elem = (
-            soup.find("h1")
-            or soup.find(
-                "meta",
-                property="og:title"
-            )
-        )
-
-        if title_elem:
-
-            if title_elem.name == "meta":
-
-                result["title"] = (
-                    title_elem.get(
-                        "content",
-                        ""
-                    ).strip()
-                )
-
-            else:
-
-                result["title"] = (
-                    normalize_whitespace(
-                        title_elem.get_text(
-                            " ",
-                            strip=True
-                        )
-                    )
-                )
-
-        meta_desc = soup.find(
-            "meta",
-            attrs={
-                "name": "description"
-            }
-        )
-
-        if meta_desc:
-
-            result["description"] = (
-                normalize_whitespace(
-                    meta_desc.get(
-                        "content",
-                        ""
-                    )
-                )
-            )
-
-        main = (
-            soup.find("main")
-            or soup.find("article")
-            or soup.body
-        )
-
-        if main:
-
-            main_text = normalize_whitespace(
-                main.get_text(
-                    " ",
-                    strip=True
-                )
-            )
-
-            if len(main_text) > len(
-                result["description"]
-            ):
-
-                result["description"] = (
-                    main_text[:12000]
-                )
-
-        # JSON-LD
-        for script in soup.find_all(
-            "script",
-            type="application/ld+json"
-        ):
-
-            try:
-
-                raw = script.string
-
-                if not raw:
-                    continue
-
-                data = json.loads(raw)
-
-                if isinstance(
-                    data,
-                    list
-                ):
-
-                    candidates = data
-
-                else:
-
-                    candidates = [data]
-
-                for item in candidates:
-
-                    if not isinstance(
-                        item,
-                        dict
-                    ):
-                        continue
-
-                    if not result["title"]:
-
-                        result["title"] = (
-                            str(
-                                item.get(
-                                    "name",
-                                    ""
-                                )
-                            ).strip()
-                        )
-
-                    desc = str(
-                        item.get(
-                            "description",
-                            ""
-                        )
-                    ).strip()
-
-                    if (
-                        desc
-                        and len(desc)
-                        > len(
-                            result["description"]
-                        )
-                    ):
-
-                        result["description"] = desc
-
-            except Exception:
-                continue
-
-        page_text = normalize_whitespace(
-            soup.get_text(
-                " ",
-                strip=True
-            )
-        )
-
-        # Label-based extraction.
-        label_patterns = {
-
-            "funding": [
-                r"funding",
-                r"funded",
-                r"studentship"
-            ],
-
-            "deadline": [
-                r"deadline",
-                r"application deadline"
-            ],
-
-            "location": [
-                r"location",
-                r"study location"
-            ],
-        }
-
-        for field, patterns in (
-            label_patterns.items()
-        ):
-
-            for pattern in patterns:
-
+            for message in messages:
                 match = re.search(
-                    rf"{pattern}\s*[:\-]?\s*(.{{5,200}})",
-                    page_text,
-                    re.I
+                    r"/(\d+)$",
+                    message.get("url", "")
                 )
 
                 if match:
-
-                    result[field] = (
-                        normalize_whitespace(
-                            match.group(1)
-                        )
+                    ids.append(
+                        int(match.group(1))
                     )
 
-                    break
+            if not ids:
+                break
 
-        return result
+            before = min(ids)
 
-    except Exception as e:
-
-        print(
-            f"    [-] FindAPhD detail error: "
-            f"{e}"
-        )
-
-        return result
-
-
-# ==============================================================================
-# FINDAPHD DIRECT ACCESS STATE
-# ==============================================================================
-
-FINDAPHD_DIRECT_BLOCKED = False
-
-
-def findaphd_direct_get(
-    url: str
-):
-    """
-    Centralized FindAPhD request.
-
-    Once the server returns 403, we stop hammering the site.
-    """
-
-    global FINDAPHD_DIRECT_BLOCKED
-
-    if FINDAPHD_DIRECT_BLOCKED:
-        return None
-
-    try:
-
-        response = session.get(
-            url,
-            timeout=25
-        )
-
-        if response.status_code == 403:
-
+        except Exception as exc:
             print(
-                "    [!] FindAPhD returned HTTP 403."
+                f"    [-] Telegram error: {exc}"
+            )
+            break
+
+        time.sleep(REQUEST_DELAY)
+
+    for message in all_messages:
+
+        text = message["text"]
+
+        if not text_matches_research(text):
+            continue
+
+        url = canonicalize_url(
+            message.get("url", "")
+        )
+
+        if not url:
+            url = (
+                f"https://t.me/s/{channel}"
             )
 
-            if FINDAPHD_STOP_DIRECT_ON_403:
+        position = {
+            "title": (
+                text[:150]
+                + ("..." if len(text) > 150 else "")
+            ),
+            "university": "",
+            "country": "",
+            "supervisor": None,
+            "deadline": None,
+            "funding": None,
+            "source": f"Telegram @{channel}",
+            "url": url,
+            "description": text,
+            "relevance": (
+                "Telegram academic vacancy "
+                "or PhD announcement."
+            ),
+        }
 
-                FINDAPHD_DIRECT_BLOCKED = True
-
-                print(
-                    "    [!] Direct FindAPhD access "
-                    "disabled for this run."
-                )
-
-            return None
-
-        return response
-
-    except Exception as e:
-
-        print(
-            f"    [-] FindAPhD request error: "
-            f"{e}"
-        )
-
-        return None
-
-
-# ==============================================================================
-# FINDAPHD DIRECT LISTING
-# ==============================================================================
-
-def collect_findaphd_listing(
-    listing,
-    page_soup
-):
-
-    url = listing["url"]
-
-    anchor_title = listing[
-        "anchor_title"
-    ]
-
-    card_text = (
-        extract_findaphd_card_for_link(
-            page_soup,
-            url
-        )
-    )
-
-    detail = parse_findaphd_detail_page(
-        url
-    )
-
-    title = (
-        detail["title"]
-        or anchor_title
-    )
-
-    description = (
-        detail["description"]
-        or card_text
-    )
-
-    full_text = (
-        f"Title: {title}\n"
-        f"University: "
-        f"{detail['university']}\n"
-        f"Location: "
-        f"{detail['location']}\n"
-        f"Funding: "
-        f"{detail['funding']}\n"
-        f"Deadline: "
-        f"{detail['deadline']}\n"
-        f"Description: "
-        f"{description}"
-    )
-
-    return {
-        "url": url,
-        "title": title,
-        "text": full_text,
-        "university": detail[
-            "university"
-        ],
-        "location": detail[
-            "location"
-        ],
-        "funding": detail[
-            "funding"
-        ],
-        "deadline": detail[
-            "deadline"
-        ],
-    }
-
-
-# ==============================================================================
-# FINDAPHD CANDIDATE PROCESSOR
-# ==============================================================================
-
-def process_findaphd_candidate(
-    vacancy: dict,
-    seen: set,
-    run_seen: set,
-    source_label: str
-) -> bool:
-
-    url = vacancy.get(
-        "url",
-        ""
-    )
-
-    title = normalize_whitespace(
-        vacancy.get(
-            "title",
-            ""
-        )
-    )
-
-    text = normalize_whitespace(
-        vacancy.get(
-            "text",
-            ""
-        )
-    )
-
-    uid = make_findaphd_uid(
-        url,
-        title
-    )
-
-    if not uid:
-        return False
-
-    if uid in seen:
-        return False
-
-    if uid in run_seen:
-        return False
-
-    run_seen.add(uid)
-
-    if not title:
-        title = "FindAPhD Opportunity"
-
-    if len(text) < 50:
-
-        print(
-            f"    [-] Too little content: "
-            f"{title[:80]}"
-        )
-
-        # We do not permanently mark malformed
-        # search results as seen.
-        return False
-
-    if not findaphd_soft_prefilter(
-        title,
-        text
-    ):
-
-        print(
-            f"    [-] Prefilter rejected: "
-            f"{title[:80]}"
-        )
-
-        mark_as_seen(
-            uid,
+        process_position(
+            position,
             seen
         )
 
+
+def scrape_telegram(seen):
+    print("=" * 70)
+    print("1️⃣ TELEGRAM CHANNELS")
+    print("=" * 70)
+
+    for channel in TELEGRAM_CHANNELS:
+        scrape_telegram_channel(
+            channel,
+            seen
+        )
+
+
+# ==============================================================================
+# GEMINI SEARCH TEST
+# ==============================================================================
+
+def test_gemini_web_search():
+    print("=" * 70)
+    print("🧪 GEMINI WEB SEARCH TEST")
+    print("=" * 70)
+
+    if ai_client is None:
+        print("[!] Gemini unavailable.")
         return False
 
+    test_query = (
+        "Find one currently advertised funded PhD "
+        "position related to visual SLAM, VIO, "
+        "robot localization, or sensor fusion."
+    )
+
+    results = gemini_web_search(
+        "Test",
+        test_query
+    )
+
     print(
-        f"    [+] Evaluating "
-        f"[{source_label}]: "
-        f"{title[:90]}"
+        f"[✓] Test returned "
+        f"{len(results)} positions."
     )
 
-    analysis = evaluate_with_gemini(
-        text
-    )
-
-    if analysis.get(
-        "is_relevant"
-    ):
-
-        sent = send_alert(
-            url,
-            analysis,
-            text
-        )
-
+    for result in results[:3]:
+        print()
         print(
-            "        [✓] MATCH "
-            f"Tier {analysis.get('tier')} "
-            f"/ Score "
-            f"{analysis.get('confidence_score')}/10"
+            "Title:",
+            result.get("title")
         )
-
-        if not sent:
-            print(
-                "        [!] Telegram alert "
-                "could not be sent."
-            )
-
-    else:
-
         print(
-            "        [-] Rejected: "
-            f"{analysis.get('reason', 'LLM filter')}"
+            "University:",
+            result.get("university")
         )
-
-    # IMPORTANT:
-    # Only now permanently mark the opportunity as processed.
-    mark_as_seen(
-        uid,
-        seen
-    )
-
-    return True
-
-
-# ==============================================================================
-# FINDAPHD DIRECT SEARCH
-# ==============================================================================
-
-def scrape_findaphd_search_direct(
-    seen: set,
-    run_seen: set
-):
-
-    if FINDAPHD_DIRECT_BLOCKED:
-        return
-
-    print(
-        "\n  🔧 Attempting direct FindAPhD access..."
-    )
-
-    for kw in ACADEMIC_SEARCH_QUERIES:
-
-        if FINDAPHD_DIRECT_BLOCKED:
-            break
-
         print(
-            f"\n  🔎 Direct query: {kw}"
+            "Source:",
+            result.get("source")
         )
-
-        for page in range(
-            1,
-            FINDAPHD_MAX_PAGES_PER_QUERY + 1
-        ):
-
-            if FINDAPHD_DIRECT_BLOCKED:
-                break
-
-            search_url = (
-                build_findaphd_search_url(
-                    kw,
-                    page
-                )
-            )
-
-            resp = findaphd_direct_get(
-                search_url
-            )
-
-            if resp is None:
-                break
-
-            if resp.status_code != 200:
-
-                print(
-                    f"    [-] HTTP "
-                    f"{resp.status_code}"
-                )
-
-                break
-
-            soup = BeautifulSoup(
-                resp.text,
-                "html.parser"
-            )
-
-            listings = (
-                extract_findaphd_listing_links(
-                    soup,
-                    search_url
-                )
-            )
-
-            if not listings:
-                break
-
-            print(
-                f"    [>] Page {page}: "
-                f"{len(listings)} links"
-            )
-
-            for listing in listings[
-                :FINDAPHD_MAX_RESULTS_PER_QUERY
-            ]:
-
-                vacancy = (
-                    collect_findaphd_listing(
-                        listing,
-                        soup
-                    )
-                )
-
-                process_findaphd_candidate(
-                    vacancy,
-                    seen,
-                    run_seen,
-                    "DIRECT"
-                )
-
-                time.sleep(
-                    FINDAPHD_REQUEST_DELAY
-                )
-
-            if len(listings) < 5:
-                break
-
-
-# ==============================================================================
-# FINDAPHD DIRECT CATEGORY
-# ==============================================================================
-
-def scrape_findaphd_categories_direct(
-    seen: set,
-    run_seen: set
-):
-
-    if FINDAPHD_DIRECT_BLOCKED:
-        return
-
-    print(
-        "\n  📚 Direct category discovery..."
-    )
-
-    for base_url in (
-        FINDAPHD_CATEGORY_URLS
-    ):
-
-        if FINDAPHD_DIRECT_BLOCKED:
-            break
-
         print(
-            f"\n  📂 Category: {base_url}"
+            "URL:",
+            result.get("url")
         )
 
-        for page in range(
-            1,
-            FINDAPHD_MAX_PAGES_PER_QUERY + 1
-        ):
-
-            if FINDAPHD_DIRECT_BLOCKED:
-                break
-
-            page_url = (
-                build_findaphd_category_url(
-                    base_url,
-                    page
-                )
-            )
-
-            resp = findaphd_direct_get(
-                page_url
-            )
-
-            if resp is None:
-                break
-
-            if resp.status_code != 200:
-                break
-
-            soup = BeautifulSoup(
-                resp.text,
-                "html.parser"
-            )
-
-            listings = (
-                extract_findaphd_listing_links(
-                    soup,
-                    page_url
-                )
-            )
-
-            if not listings:
-                break
-
-            print(
-                f"    [>] Page {page}: "
-                f"{len(listings)} links"
-            )
-
-            for listing in listings:
-
-                vacancy = (
-                    collect_findaphd_listing(
-                        listing,
-                        soup
-                    )
-                )
-
-                process_findaphd_candidate(
-                    vacancy,
-                    seen,
-                    run_seen,
-                    "CATEGORY"
-                )
-
-                time.sleep(
-                    FINDAPHD_REQUEST_DELAY
-                )
-
-
-# ==============================================================================
-# GOOGLE CUSTOM SEARCH
-# ==============================================================================
-
-def google_cse_available() -> bool:
-
-    return bool(
-        GOOGLE_CSE_API_KEY
-        and GOOGLE_CSE_ID
-    )
-
-
-def google_custom_search(
-    query: str,
-    start: int = 1
-):
-
-    if not google_cse_available():
-
-        return []
-
-    params = {
-        "key": GOOGLE_CSE_API_KEY,
-        "cx": GOOGLE_CSE_ID,
-        "q": query,
-        "start": start,
-        "num": GOOGLE_SEARCH_RESULTS_PER_QUERY,
-        "safe": "off",
-    }
-
-    try:
-
-        response = session.get(
-            GOOGLE_CSE_ENDPOINT,
-            params=params,
-            timeout=25
-        )
-
-        if response.status_code != 200:
-
-            print(
-                f"    [-] Google CSE HTTP "
-                f"{response.status_code}"
-            )
-
-            try:
-                print(
-                    f"        {response.text[:300]}"
-                )
-            except Exception:
-                pass
-
-            return []
-
-        data = response.json()
-
-        if "error" in data:
-
-            print(
-                "    [-] Google CSE error: "
-                f"{data['error']}"
-            )
-
-            return []
-
-        return data.get(
-            "items",
-            []
-        )
-
-    except Exception as e:
-
-        print(
-            f"    [-] Google search error: "
-            f"{e}"
-        )
-
-        return []
-
-
-# ==============================================================================
-# FINDAPHD SEARCH RESULT PARSER
-# ==============================================================================
-
-def clean_search_snippet(
-    text: str
-) -> str:
-
-    if not text:
-        return ""
-
-    text = BeautifulSoup(
-        text,
-        "html.parser"
-    ).get_text(
-        " ",
-        strip=True
-    )
-
-    return normalize_whitespace(
-        text
-    )
-
-
-def vacancy_from_google_result(
-    item: dict
-) -> dict:
-
-    url = canonicalize_url(
-        item.get(
-            "link",
-            ""
-        )
-    )
-
-    title = normalize_whitespace(
-        item.get(
-            "title",
-            ""
-        )
-    )
-
-    snippet = clean_search_snippet(
-        item.get(
-            "snippet",
-            ""
-        )
-    )
-
-    display_link = normalize_whitespace(
-        item.get(
-            "displayLink",
-            ""
-        )
-    )
-
-    html_snippet = clean_search_snippet(
-        item.get(
-            "htmlSnippet",
-            ""
-        )
-    )
-
-    combined_snippet = (
-        snippet
-        or html_snippet
-    )
-
-    text = (
-        f"Title: {title}\n"
-        f"Source: {display_link}\n"
-        f"Search snippet: "
-        f"{combined_snippet}\n"
-        f"URL: {url}"
-    )
-
-    return {
-        "url": url,
-        "title": title,
-        "text": text,
-        "university": "",
-        "location": "",
-        "funding": "",
-        "deadline": "",
-    }
-
-
-# ==============================================================================
-# OPTIONAL DETAIL FETCH AFTER SEARCH DISCOVERY
-# ==============================================================================
-
-def enrich_findaphd_from_direct_page(
-    vacancy: dict
-) -> dict:
-
-    global FINDAPHD_DIRECT_BLOCKED
-
-    if FINDAPHD_DIRECT_BLOCKED:
-        return vacancy
-
-    url = vacancy.get(
-        "url",
-        ""
-    )
-
-    if not url:
-        return vacancy
-
-    try:
-
-        resp = findaphd_direct_get(
-            url
-        )
-
-        if resp is None:
-            return vacancy
-
-        if resp.status_code != 200:
-            return vacancy
-
-        soup = BeautifulSoup(
-            resp.text,
-            "html.parser"
-        )
-
-        title_elem = (
-            soup.find("h1")
-            or soup.find(
-                "meta",
-                property="og:title"
-            )
-        )
-
-        title = ""
-
-        if title_elem:
-
-            if title_elem.name == "meta":
-
-                title = normalize_whitespace(
-                    title_elem.get(
-                        "content",
-                        ""
-                    )
-                )
-
-            else:
-
-                title = normalize_whitespace(
-                    title_elem.get_text(
-                        " ",
-                        strip=True
-                    )
-                )
-
-        meta_desc = soup.find(
-            "meta",
-            attrs={
-                "name": "description"
-            }
-        )
-
-        meta_description = ""
-
-        if meta_desc:
-
-            meta_description = (
-                normalize_whitespace(
-                    meta_desc.get(
-                        "content",
-                        ""
-                    )
-                )
-            )
-
-        main = (
-            soup.find("main")
-            or soup.find("article")
-        )
-
-        main_text = ""
-
-        if main:
-
-            main_text = normalize_whitespace(
-                main.get_text(
-                    " ",
-                    strip=True
-                )
-            )
-
-        if not title:
-            title = vacancy.get(
-                "title",
-                ""
-            )
-
-        description = max(
-            [
-                vacancy.get(
-                    "text",
-                    ""
-                ),
-                meta_description,
-                main_text
-            ],
-            key=len
-        )
-
-        vacancy["title"] = title
-
-        vacancy["text"] = (
-            f"Title: {title}\n"
-            f"Description: "
-            f"{description[:12000]}\n"
-            f"URL: {url}"
-        )
-
-        return vacancy
-
-    except Exception:
-        return vacancy
-
-
-# ==============================================================================
-# FINDAPHD SEARCH-ENGINE DISCOVERY
-# ==============================================================================
-
-def scrape_findaphd_google_discovery(
-    seen: set,
-    run_seen: set
-):
-
-    if not google_cse_available():
-
-        print(
-            "\n  [!] Google CSE credentials "
-            "not configured."
-        )
-
-        print(
-            "  [!] FindAPhD search fallback "
-            "will be unavailable."
-        )
-
-        print(
-            "  [!] Add:"
-        )
-
-        print(
-            "      GOOGLE_CSE_API_KEY"
-        )
-
-        print(
-            "      GOOGLE_CSE_ID"
-        )
-
-        return
-
-    print(
-        "\n"
-        + "-" * 65
-    )
-
-    print(
-        "🔎 FINDAPHD INDEXED SEARCH DISCOVERY"
-    )
-
-    print(
-        "-" * 65
-    )
-
-    discovered_urls = {}
-
-    all_queries = (
-        FINDAPHD_DISCOVERY_QUERIES
-        + FINDAPHD_LATEST_DISCOVERY_QUERIES
-    )
-
-    for query in all_queries:
-
-        print(
-            f"\n  🔍 {query}"
-        )
-
-        items = google_custom_search(
-            query,
-            start=1
-        )
-
-        if not items:
-
-            print(
-                "    [-] No search results."
-            )
-
-            continue
-
-        accepted = 0
-
-        for item in items:
-
-            url = canonicalize_url(
-                item.get(
-                    "link",
-                    ""
-                )
-            )
-
-            if not is_findaphd_vacancy_url(
-                url
-            ):
-                continue
-
-            title = normalize_whitespace(
-                item.get(
-                    "title",
-                    ""
-                )
-            )
-
-            snippet = clean_search_snippet(
-                item.get(
-                    "snippet",
-                    ""
-                )
-            )
-
-            vacancy = (
-                vacancy_from_google_result(
-                    item
-                )
-            )
-
-            uid = make_findaphd_uid(
-                url,
-                title
-            )
-
-            if uid in run_seen:
-                continue
-
-            # Keep the strongest/longest result if
-            # the same project appeared in multiple queries.
-            old = discovered_urls.get(
-                uid
-            )
-
-            if old:
-
-                if len(
-                    vacancy["text"]
-                ) > len(
-                    old["text"]
-                ):
-
-                    discovered_urls[
-                        uid
-                    ] = vacancy
-
-                continue
-
-            discovered_urls[
-                uid
-            ] = vacancy
-
-            accepted += 1
-
-        print(
-            f"    [+] Accepted "
-            f"{accepted} FindAPhD URLs"
-        )
-
-        time.sleep(
-            GOOGLE_SEARCH_DELAY
-        )
-
-    print(
-        "\n  📊 Unique FindAPhD URLs discovered: "
-        f"{len(discovered_urls)}"
-    )
-
-    if not discovered_urls:
-        return
-
-    candidates_processed = 0
-
-    for uid, vacancy in (
-        discovered_urls.items()
-    ):
-
-        if (
-            candidates_processed
-            >= FINDAPHD_MAX_CANDIDATES_PER_RUN
-        ):
-
-            print(
-                "  [!] FindAPhD candidate "
-                "limit reached."
-            )
-
-            break
-
-        if uid in seen:
-            continue
-
-        title = vacancy.get(
-            "title",
-            ""
-        )
-
-        snippet_text = vacancy.get(
-            "text",
-            ""
-        )
-
-        # Search-result-level prefilter.
-        if not findaphd_soft_prefilter(
-            title,
-            snippet_text
-        ):
-
-            mark_as_seen(
-                uid,
-                seen
-            )
-
-            continue
-
-        # Try direct detail only after discovery.
-        #
-        # If GitHub gets 403, enrich function will
-        # simply keep the indexed snippet.
-        if not FINDAPHD_DIRECT_BLOCKED:
-
-            vacancy = (
-                enrich_findaphd_from_direct_page(
-                    vacancy
-                )
-            )
-
-        process_findaphd_candidate(
-            vacancy,
-            seen,
-            run_seen,
-            "GOOGLE INDEX"
-        )
-
-        candidates_processed += 1
-
-        time.sleep(
-            FINDAPHD_REQUEST_DELAY
-        )
-
-
-# ==============================================================================
-# FINDAPHD MAIN SCRAPER
-# ==============================================================================
-
-def scrape_findaphd_direct(
-    seen: set
-):
-
-    global FINDAPHD_DIRECT_BLOCKED
-
-    print(
-        "\n"
-        + "=" * 70
-    )
-
-    print(
-        "🌍 FINDAPHD HYBRID SCRAPER"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    print(
-        "Strategy:"
-    )
-
-    print(
-        "  1. Direct FindAPhD access"
-    )
-
-    print(
-        "  2. Detect 403"
-    )
-
-    print(
-        "  3. Stop direct requests"
-    )
-
-    print(
-        "  4. Search-engine indexed discovery"
-    )
-
-    print(
-        "  5. Gemini evaluation"
-    )
-
-    run_seen = set()
-
-    # --------------------------------------------------------------------------
-    # DIRECT
-    # --------------------------------------------------------------------------
-
-    if FINDAPHD_TRY_DIRECT:
-
-        scrape_findaphd_search_direct(
-            seen,
-            run_seen
-        )
-
-        if not FINDAPHD_DIRECT_BLOCKED:
-
-            scrape_findaphd_categories_direct(
-                seen,
-                run_seen
-            )
-
-    # --------------------------------------------------------------------------
-    # FALLBACK / PRIMARY DISCOVERY
-    # --------------------------------------------------------------------------
-
-    if FINDAPHD_DIRECT_BLOCKED:
-
-        print(
-            "\n"
-            + "!" * 70
-        )
-
-        print(
-            "⚠️ FindAPhD direct access is blocked."
-        )
-
-        print(
-            "➡️ Switching to indexed search discovery."
-        )
-
-        print(
-            "!" * 70
-        )
-
-    else:
-
-        print(
-            "\n  🔎 Running indexed discovery "
-            "in addition to direct scraping..."
-        )
-
-    scrape_findaphd_google_discovery(
-        seen,
-        run_seen
-    )
-
-    print(
-        "\n[✓] FindAPhD scan finished."
-    )
-
-
-# ==============================================================================
-# EURAXESS
-# ==============================================================================
-
-EURAXESS_QUERIES = [
-    "visual inertial odometry",
-    "visual SLAM",
-    "visual navigation",
-    "sensor fusion",
-    "GNSS positioning",
-    "robot localization",
-    "robot navigation",
-    "computer vision robotics",
-    "autonomous navigation",
-    "field robotics",
-    "embedded AI"
-]
-
-
-def scrape_euraxess_direct(
-    seen: set
-):
-
-    print(
-        "\n🇪🇺 Scanning EURAXESS..."
-    )
-
-    for kw in EURAXESS_QUERIES:
-
-        try:
-
-            search_url = (
-                "https://euraxess.ec.europa.eu/jobs/search?"
-                + urllib.parse.urlencode(
-                    {"keywords": kw}
-                )
-            )
-
-            resp = session.get(
-                search_url,
-                timeout=25
-            )
-
-            if resp.status_code != 200:
-                continue
-
-            soup = BeautifulSoup(
-                resp.text,
-                "html.parser"
-            )
-
-            job_links = soup.find_all(
-                "a",
-                href=re.compile(
-                    r"^/jobs/\d+"
-                )
-            )
-
-            unique_jobs = {}
-
-            for a in job_links:
-
-                href = a.get(
-                    "href"
-                )
-
-                title = normalize_whitespace(
-                    a.get_text(
-                        strip=True
-                    )
-                )
-
-                if (
-                    len(title) > 15
-                    and href not in unique_jobs
-                ):
-
-                    unique_jobs[
-                        href
-                    ] = title
-
-            if unique_jobs:
-
-                print(
-                    f"  [>] EURAXESS "
-                    f"('{kw}'): "
-                    f"{len(unique_jobs)} listings."
-                )
-
-            for href, title in list(
-                unique_jobs.items()
-            )[:6]:
-
-                link = (
-                    "https://euraxess.ec.europa.eu"
-                    f"{href}"
-                )
-
-                if link in seen:
-                    continue
-
-                job_desc = ""
-
-                try:
-
-                    job_resp = session.get(
-                        link,
-                        timeout=15
-                    )
-
-                    if job_resp.status_code == 200:
-
-                        jsoup = BeautifulSoup(
-                            job_resp.text,
-                            "html.parser"
-                        )
-
-                        desc_div = (
-                            jsoup.find(
-                                "div",
-                                class_="node__content"
-                            )
-                            or jsoup.find(
-                                "main"
-                            )
-                        )
-
-                        if desc_div:
-
-                            job_desc = (
-                                desc_div.get_text(
-                                    separator="\n",
-                                    strip=True
-                                )
-                            )
-
-                except Exception:
-                    pass
-
-                full_text = (
-                    f"{title}\n"
-                    f"{job_desc}"
-                )[:6000]
-
-                if not fast_prefilter(
-                    full_text
-                ):
-
-                    mark_as_seen(
-                        link,
-                        seen
-                    )
-
-                    continue
-
-                print(
-                    f"[+] Evaluating EURAXESS: "
-                    f"{title[:55]}..."
-                )
-
-                analysis = evaluate_with_gemini(
-                    full_text
-                )
-
-                if analysis.get(
-                    "is_relevant"
-                ):
-
-                    send_alert(
-                        link,
-                        analysis,
-                        full_text
-                    )
-
-                else:
-
-                    print(
-                        f"    [-] Skipped: "
-                        f"{analysis.get('reason', 'LLM filter')}"
-                    )
-
-                mark_as_seen(
-                    link,
-                    seen
-                )
-
-        except Exception as e:
-
-            print(
-                f"[-] EURAXESS error: {e}"
-            )
-
-
-# ==============================================================================
-# RSS ACADEMIC PORTALS
-# ==============================================================================
-
-NEW_ACADEMIC_PORTALS = [
-
-    "https://www.jobs.ac.uk/feeds/subject-areas/electrical-and-electronic-engineering",
-
-    "https://www.jobs.ac.uk/feeds/subject-areas/computer-science",
-
-    "https://www.academictransfer.com/en/jobs/rss/?q=PhD+robotics",
-
-    "https://www.academictransfer.com/en/jobs/rss/?q=PhD+computer+vision",
-
-    "https://www.academictransfer.com/en/jobs/rss/?q=PhD+navigation",
-
-    "https://academicpositions.com/feed/rss?field=computer-science-electrical-engineering",
-
-    "https://academicpositions.com/feed/rss?field=robotics",
-
-    "https://academicpositions.com/feed/rss?field=artificial-intelligence",
-]
-
-
-def scrape_academic_rss_feeds(
-    seen: set
-):
-
-    print(
-        "\n🎓 Scanning academic RSS portals..."
-    )
-
-    for feed_url in NEW_ACADEMIC_PORTALS:
-
-        try:
-
-            resp = session.get(
-                feed_url,
-                timeout=25
-            )
-
-            if resp.status_code != 200:
-
-                print(
-                    f"  [-] RSS HTTP "
-                    f"{resp.status_code}: "
-                    f"{feed_url}"
-                )
-
-                continue
-
-            feed = feedparser.parse(
-                resp.content
-            )
-
-            feed_name = (
-                feed_url.split("/")[-1]
-                or feed_url
-            )
-
-            if feed.entries:
-
-                print(
-                    f"  [>] Feed '{feed_name}': "
-                    f"{len(feed.entries)} entries."
-                )
-
-            for entry in feed.entries:
-
-                link = entry.get(
-                    "link",
-                    ""
-                )
-
-                uid = entry.get(
-                    "id",
-                    link
-                )
-
-                if not uid:
-                    continue
-
-                if uid in seen:
-                    continue
-
-                if (
-                    hasattr(
-                        entry,
-                        "published_parsed"
-                    )
-                    and entry.published_parsed
-                ):
-
-                    pub_dt = datetime(
-                        *entry.published_parsed[:6],
-                        tzinfo=timezone.utc
-                    )
-
-                    if not is_recent_date(
-                        pub_dt
-                    ):
-
-                        mark_as_seen(
-                            uid,
-                            seen
-                        )
-
-                        continue
-
-                content = (
-                    f"{entry.get('title', '')}\n"
-                    f"{entry.get('summary', '')}\n"
-                    f"{entry.get('description', '')}"
-                )
-
-                if (
-                    len(content) < 30
-                    or not fast_prefilter(content)
-                ):
-
-                    mark_as_seen(
-                        uid,
-                        seen
-                    )
-
-                    continue
-
-                print(
-                    f"[+] Evaluating Academic: "
-                    f"{entry.get('title', '')[:55]}..."
-                )
-
-                analysis = evaluate_with_gemini(
-                    content
-                )
-
-                if analysis.get(
-                    "is_relevant"
-                ):
-
-                    send_alert(
-                        link,
-                        analysis,
-                        content
-                    )
-
-                    print(
-                        "    [✓] MATCH CONFIRMED "
-                        f"(Tier {analysis.get('tier')} - "
-                        f"Score "
-                        f"{analysis.get('confidence_score')}/10)"
-                    )
-
-                else:
-
-                    print(
-                        f"    [-] Skipped: "
-                        f"{analysis.get('reason', 'LLM filter')}"
-                    )
-
-                mark_as_seen(
-                    uid,
-                    seen
-                )
-
-        except Exception as e:
-
-            print(
-                f"  [-] Academic feed error: "
-                f"{feed_url[:60]}...: {e}"
-            )
-
-
-# ==============================================================================
-# TEST TELEGRAM
-# ==============================================================================
-
-def test_telegram():
-
-    endpoint = (
-        "https://api.telegram.org/bot"
-        f"{BOT_TOKEN}/sendMessage"
-    )
-
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": "✅ PhD Finder Telegram test"
-    }
-
-    response = session.post(
-        endpoint,
-        json=payload,
-        timeout=20
-    )
-
-    print(
-        "STATUS:",
-        response.status_code
-    )
-
-    print(
-        "RESPONSE:",
-        response.text
-    )
+    return bool(results)
 
 
 # ==============================================================================
@@ -3324,18 +1528,11 @@ def test_telegram():
 
 def main():
 
-    print(
-        "\n"
-        + "=" * 70
-    )
-
-    print(
-        "🚀 Running PhD Finder Agent"
-    )
-
-    print(
-        "=" * 70
-    )
+    print()
+    print("=" * 70)
+    print("🚀 Running PhD Finder Agent")
+    print("=" * 70)
+    print()
 
     seen = load_seen()
 
@@ -3344,144 +1541,75 @@ def main():
         f"{len(seen)} items."
     )
 
-    # --------------------------------------------------------------------------
-    # Google Search status
-    # --------------------------------------------------------------------------
-
+    print()
+    print("🔎 Discovery configuration:")
     print(
-        "\n🔎 FindAPhD discovery configuration:"
+        f"   Gemini: "
+        f"{'✓ configured' if ai_client else '✗ NOT configured'}"
     )
 
-    if google_cse_available():
+    print(
+        f"   Search model: "
+        f"{GEMINI_SEARCH_MODEL}"
+    )
 
-        print(
-            "   [✓] Google CSE configured"
-        )
+    print(
+        f"   Evaluation model: "
+        f"{GEMINI_EVAL_MODEL}"
+    )
 
-    else:
+    print(
+        "   FindAPhD: "
+        "Gemini Google Search grounding"
+    )
 
-        print(
-            "   [!] Google CSE NOT configured"
-        )
+    print(
+        "   EURAXESS: "
+        "Gemini Google Search grounding"
+    )
 
-        print(
-            "   → Direct FindAPhD only"
-            " unless credentials are added."
-        )
+    print(
+        "   University pages: "
+        "Gemini Google Search grounding"
+    )
 
     # --------------------------------------------------------------------------
     # 1. Telegram
     # --------------------------------------------------------------------------
 
-    print(
-        "\n"
-        + "=" * 70
-    )
+    scrape_telegram(seen)
 
-    print(
-        "1️⃣ TELEGRAM CHANNELS"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    for ch in CHANNELS_TO_SCRAPE:
-
-        scrape_telegram_channel_deep(
-            ch,
-            seen
-        )
+    save_seen(seen)
 
     # --------------------------------------------------------------------------
-    # 2. FindAPhD
+    # 2. Gemini Web Research
     # --------------------------------------------------------------------------
 
-    print(
-        "\n"
-        + "=" * 70
-    )
+    print()
+    print("=" * 70)
+    print("2️⃣ GEMINI WEB DISCOVERY")
+    print("=" * 70)
 
-    print(
-        "2️⃣ FINDAPHD"
-    )
+    scrape_with_gemini(seen)
 
-    print(
-        "=" * 70
-    )
-
-    scrape_findaphd_direct(
-        seen
-    )
+    save_seen(seen)
 
     # --------------------------------------------------------------------------
-    # 3. EURAXESS
+    # Finish
     # --------------------------------------------------------------------------
 
-    print(
-        "\n"
-        + "=" * 70
-    )
-
-    print(
-        "3️⃣ EURAXESS"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    scrape_euraxess_direct(
-        seen
-    )
-
-    # --------------------------------------------------------------------------
-    # 4. RSS
-    # --------------------------------------------------------------------------
-
-    print(
-        "\n"
-        + "=" * 70
-    )
-
-    print(
-        "4️⃣ ACADEMIC RSS PORTALS"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    scrape_academic_rss_feeds(
-        seen
-    )
-
-    # --------------------------------------------------------------------------
-    # DONE
-    # --------------------------------------------------------------------------
-
-    print(
-        "\n"
-        + "=" * 70
-    )
-
-    print(
-        "✅ RUN COMPLETE"
-    )
+    print()
+    print("=" * 70)
+    print("✅ RUN COMPLETE")
+    print("=" * 70)
 
     print(
         f"📂 Seen database now contains "
         f"{len(seen)} items."
     )
 
-    print(
-        "=" * 70
-    )
+    print("=" * 70)
 
 
 if __name__ == "__main__":
-
-    # Uncomment for Telegram testing.
-    # test_telegram()
-
     main()
