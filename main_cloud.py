@@ -4,59 +4,18 @@ import json
 import time
 import html
 import hashlib
-import warnings
-from datetime import datetime, timezone, timedelta
-
 import requests
-import feedparser
-from bs4 import BeautifulSoup
-from dotenv import load_dotenv
 
-warnings.filterwarnings("ignore")
+from datetime import datetime, timezone, timedelta
+from urllib.parse import quote, urlparse
+
+from google import genai
+from google.genai import types
+
 
 # ==============================================================================
 # CONFIG
 # ==============================================================================
-
-load_dotenv()
-
-BOT_TOKEN = os.getenv("TG_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TG_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-GEMINI_SEARCH_MODEL = os.getenv(
-    "GEMINI_SEARCH_MODEL",
-    "gemini-3.8-flash"
-)
-
-GEMINI_EVAL_MODEL = os.getenv(
-    "GEMINI_EVAL_MODEL",
-    "gemini-3.8-flash"
-)
-
-DATA_DIR = "data"
-SEEN_FILE = os.path.join(DATA_DIR, "seen_posts.json")
-
-MAX_POST_AGE_DAYS = 60
-
-# Keep 5 web search tasks as requested.
-MAX_WEB_SEARCH_TASKS = 5
-MAX_RESULTS_PER_WEB_TASK = 6
-
-# Gemini batch settings.
-GEMINI_BATCH_SIZE = 15
-
-# Safety limits.
-MAX_TELEGRAM_CANDIDATES_PER_RUN = 40
-MAX_WEB_CANDIDATES_PER_RUN = 30
-
-REQUEST_DELAY = 1.0
-
-TELEGRAM_MIN_CONFIDENCE = 0.72
-SEND_TIER_2 = True
-
-TELEGRAM_PAGES = 5
 
 TELEGRAM_CHANNELS = [
     "expertapply",
@@ -70,113 +29,56 @@ TELEGRAM_CHANNELS = [
     "PargarPositions",
 ]
 
+SEEN_FILE = "seen_professors.json"
+
+# ----------------------------------------------------------------------
+# Gemini
+# ----------------------------------------------------------------------
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Current Gemini 3.8 Flash model IDs
+GEMINI_SEARCH_MODEL = os.getenv(
+    "GEMINI_SEARCH_MODEL",
+    "gemini-3.8-flash"
+)
+
+GEMINI_EVAL_MODEL = os.getenv(
+    "GEMINI_EVAL_MODEL",
+    "gemini-3.8-flash"
+)
+
+# ----------------------------------------------------------------------
+# Search / evaluation limits
+# ----------------------------------------------------------------------
+
+MAX_WEB_SEARCH_TASKS = 5
+MAX_RESULTS_PER_WEB_TASK = 6
+
+GEMINI_BATCH_SIZE = 15
+
+MAX_TELEGRAM_CANDIDATES_PER_RUN = 40
+MAX_WEB_CANDIDATES_PER_RUN = 30
+
+# Telegram recent window
+TELEGRAM_DAYS_BACK = 21
+
+# Retry behavior
+GEMINI_MAX_RETRIES = 3
+GEMINI_RETRY_DELAY = 4
+
 
 # ==============================================================================
-# GEMINI STATE
+# TELEGRAM
 # ==============================================================================
 
-GEMINI_QUOTA_EXHAUSTED = False
-
-try:
-    from google import genai
-    from google.genai import types
-
-    if GEMINI_API_KEY:
-        ai_client = genai.Client(api_key=GEMINI_API_KEY)
-    else:
-        ai_client = None
-
-except Exception as e:
-    print(f"⚠️ Could not import google-genai: {e}")
-    ai_client = None
-
-
-# ==============================================================================
-# USER PROFILE / EVALUATION PROMPT
-# ==============================================================================
-
-SYSTEM_PROMPT = """
-You are evaluating PhD opportunities for a candidate applying for Fall 2027.
-
-Candidate research profile:
-
-- Electrical Engineering / robotics / localization
-- VIO: Visual-Inertial Odometry
-- Visual SLAM
-- Visual Navigation
-- Visual Localization
-- Sensor Fusion
-- GNSS / GNSS positioning
-- GNSS/INS
-- Inertial Navigation
-- Robot Localization
-- State Estimation
-- Autonomous Navigation
-- Factor Graphs
-- LiDAR-Camera-IMU fusion
-- Robotics perception
-- Computer Vision
-- 3D vision
-- Deep Learning / Transformers
-- Uncertainty-aware learning
-- Multi-task learning
-- Neural networks for localization/navigation
-
-Current research includes:
-- GNSS pseudorange correction
-- GNSSFormer / Transformer-based models
-- learned weighting
-- uncertainty-aware / multi-task learning
-- positioning and localization
-
-Target:
-Direct funded PhD positions for Fall 2027 or positions starting during 2027.
-
-IMPORTANT:
-Do not reject a position simply because it is not explicitly called VIO.
-Strong adjacent areas such as SLAM, visual localization, sensor fusion,
-robot localization, state estimation, GNSS/INS, autonomous navigation,
-robot perception, LiDAR-camera fusion, and 3D vision are relevant.
-
-TIER 1:
-Direct match:
-VIO, visual-inertial navigation, visual SLAM, visual odometry,
-visual localization, GNSS/INS, GNSS positioning, sensor fusion,
-robot localization, autonomous navigation, state estimation,
-factor graphs, LiDAR-camera-IMU fusion, robotics localization.
-
-TIER 2:
-Strong adjacent match:
-computer vision, 3D vision, robotics perception, LiDAR,
-robot perception, pose estimation, trajectory estimation,
-autonomous vehicles, field robotics, probabilistic robotics,
-deep learning for robotics, self-supervised perception,
-uncertainty estimation, neural localization.
-
-TIER 3:
-Technically interesting but substantially farther away.
-
-TIER 4:
-Weak or irrelevant.
-
-REJECT:
-biology, molecular biology, chemistry, materials science,
-biomedical wet lab, prosthetics, biomechanics, mechanical design,
-manufacturing, CFD/fluid dynamics, social science, economics,
-policy, management, generic business/data science,
-generic AI without a robotics/navigation/computer vision connection,
-Master-only opportunities, undergraduate opportunities,
-postdoctoral positions, internships.
-
-For every candidate determine:
-- is_relevant
-- tier
-- confidence_score from 0 to 1
-- key_topics
-- research_fit
-- technical_gaps
-- reason
-"""
+TELEGRAM_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/154.0 Safari/537.36"
+    )
+}
 
 
 # ==============================================================================
@@ -184,234 +86,222 @@ For every candidate determine:
 # ==============================================================================
 
 PHD_PATTERNS = [
-    r"\bph\.?d\b",
+    r"\bph\.?\s*d\.?\b",
     r"\bphd\b",
     r"\bdoctoral\b",
     r"\bdoctorate\b",
-    r"دکتری",
-    r"دکترا",
-]
-
-MASTER_ONLY_PATTERNS = [
-    r"\bmaster'?s?\b",
-    r"\bmsc\b",
-    r"\bma\b",
-    r"master degree",
-    r"کارشناسی ارشد",
-    r"ارشد",
+    r"\bdoctoral researcher\b",
+    r"\bdoctoral student\b",
+    r"\bdoctoral candidate\b",
+    r"\bphd position\b",
+    r"\bphd studentship\b",
+    r"\bphd studentship\b",
+    r"\bfunded phd\b",
+    r"\bfully funded phd\b",
+    r"\bphd vacancy\b",
+    r"\bphd opening\b",
+    r"\bphd opportunity\b",
 ]
 
 STRONG_RESEARCH_PATTERNS = [
-    r"\bvios?\b",
-    r"\bvisual[- ]inertial\b",
+    # VIO / SLAM
+    r"\bvisual inertial\b",
+    r"\bvisual-inertial\b",
     r"\bvisual odometry\b",
-    r"\bvisual slam\b",
-    r"\bslam\b",
+    r"\binertial odometry\b",
+    r"\bvisual navigation\b",
     r"\bvisual localization\b",
+    r"\bvisual localisation\b",
+    r"\bslam\b",
+    r"\bsemantic slam\b",
+    r"\bvisual slam\b",
+    r"\bvins\b",
+
+    # Localization / navigation
+    r"\brobot localization\b",
+    r"\brobot localisation\b",
+    r"\bstate estimation\b",
+    r"\bpose estimation\b",
+    r"\bpositioning\b",
     r"\blocalization\b",
+    r"\blocalisation\b",
     r"\bnavigation\b",
-    r"\bsensor fusion\b",
+
+    # GNSS / INS
     r"\bgnss\b",
     r"\bgps\b",
     r"\bins\b",
-    r"\binertial navigation\b",
-    r"\bstate estimation\b",
-    r"\brobot localization\b",
-    r"\brobot navigation\b",
-    r"\brobotics\b",
-    r"\bcomputer vision\b",
-    r"\b3d vision\b",
-    r"\blidar\b",
-    r"\bperception\b",
-    r"\bfactor graph\b",
-    r"\bautonomous vehicle\b",
-    r"\bautonomous navigation\b",
-    r"\bpose estimation\b",
-    r"\btrajectory estimation\b",
-    r"\bcamera[- ]imu\b",
-]
+    r"\bgnss/ins\b",
+    r"\bgnss ins\b",
+    r"\bsensor fusion\b",
+    r"\bmulti[- ]sensor fusion\b",
 
-ADJACENT_PATTERNS = [
+    # Robotics
+    r"\brobotics\b",
+    r"\bmobile robot\b",
+    r"\bautonomous robot\b",
+    r"\bautonomous navigation\b",
+    r"\bautonomous systems\b",
+
+    # Perception
+    r"\b3d perception\b",
+    r"\b3d vision\b",
+    r"\bcomputer vision\b",
+    r"\brobot perception\b",
+    r"\blidar\b",
+    r"\bli[- ]?dar\b",
+    r"\bcamera[- ]imu\b",
+    r"\bcamera imu\b",
+
+    # Related ML / geometry
+    r"\bgeometric vision\b",
     r"\bdeep learning\b",
     r"\bmachine learning\b",
-    r"\btransformer\b",
-    r"\bneural network\b",
-    r"\bself[- ]supervised\b",
+    r"\bmultimodal perception\b",
+    r"\bscene understanding\b",
     r"\b3d reconstruction\b",
-    r"\bpoint cloud\b",
+    r"\bstructure from motion\b",
+    r"\bsensor calibration\b",
+]
+
+ADJACENT_RESEARCH_PATTERNS = [
+    r"\bcomputer vision\b",
+    r"\b3d vision\b",
+    r"\b3d reconstruction\b",
     r"\brobot perception\b",
+    r"\brobotics\b",
     r"\bautonomous systems\b",
-    r"\brobot perception\b",
+    r"\bmachine learning\b",
+    r"\bdeep learning\b",
+    r"\bimage processing\b",
+    r"\bmultimodal\b",
+    r"\bperception\b",
 ]
 
 HARD_EXCLUDE_PATTERNS = [
+    # Jobs / academic levels
     r"\bpostdoc\b",
     r"\bpostdoctoral\b",
+    r"\bpost-doctoral\b",
     r"\bundergraduate\b",
-    r"\bbachelor'?s?\b",
+    r"\binternship\b",
+    r"\bintern\b",
+
+    # Biology / medicine
     r"\bbiology\b",
     r"\bmolecular\b",
     r"\bgenomics\b",
-    r"\bcell culture\b",
+    r"\bgenetic\b",
+    r"\bbiomedical\b",
+    r"\bneuroscience\b",
+    r"\bclinical\b",
+
+    # Chemistry / materials
     r"\bchemistry\b",
+    r"\bchemical engineering\b",
     r"\bmaterials science\b",
-    r"\bprosthetic\b",
-    r"\borthopedic\b",
-    r"\bbiomechanical\b",
-    r"\bbiomechanics\b",
+    r"\bmaterial science\b",
+    r"\bpolymer\b",
+    r"\bnanomaterial\b",
+
+    # Mechanical
     r"\bmechanical design\b",
     r"\bmanufacturing\b",
     r"\bcfd\b",
     r"\bfluid dynamics\b",
+    r"\bthermodynamics\b",
+    r"\bstructural engineering\b",
+    r"\bfinite element\b",
+
+    # Other irrelevant
+    r"\bprosthetic\b",
+    r"\bbiomechanics\b",
     r"\bpanel discussion\b",
     r"\bapplication fee\b",
 ]
 
 
-def normalize_whitespace(text):
-    if not text:
-        return ""
+def regex_any(text, patterns):
+    text = text.lower()
 
-    return re.sub(r"\s+", " ", str(text)).strip()
+    return any(
+        re.search(pattern, text, flags=re.IGNORECASE)
+        for pattern in patterns
+    )
 
 
-def text_matches_research(text):
+def count_matches(text, patterns):
+    text = text.lower()
+
+    count = 0
+
+    for pattern in patterns:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            count += 1
+
+    return count
+
+
+def local_candidate_filter(title, description):
     """
-    Fast local pre-filter.
+    Fast local filter.
 
-    This should be intentionally strict because anything passing this
-    function may later consume Gemini API quota.
+    Goal:
+    - must look like a PhD/doctoral opportunity
+    - must contain strong VIO/SLAM/navigation/GNSS/robotics terms
+      OR multiple adjacent research terms
+    - reject obvious irrelevant areas
     """
 
-    text = normalize_whitespace(text).lower()
+    text = f"{title}\n{description}".lower()
 
-    if not text:
+    # Hard exclusions
+    if regex_any(text, HARD_EXCLUDE_PATTERNS):
         return False
 
-    # --------------------------------------------------------------
-    # Hard exclusions
-    # --------------------------------------------------------------
-
-    for pattern in HARD_EXCLUDE_PATTERNS:
-        if re.search(pattern, text, re.IGNORECASE):
-            return False
-
-    # --------------------------------------------------------------
-    # Must explicitly look like a PhD / doctoral opportunity.
-    # --------------------------------------------------------------
-
-    has_phd = any(
-        re.search(pattern, text, re.IGNORECASE)
-        for pattern in PHD_PATTERNS
-    )
+    # Must be PhD/doctoral
+    has_phd = regex_any(text, PHD_PATTERNS)
 
     if not has_phd:
         return False
 
-    # --------------------------------------------------------------
-    # Research relevance.
-    # --------------------------------------------------------------
+    strong_count = count_matches(text, STRONG_RESEARCH_PATTERNS)
+    adjacent_count = count_matches(text, ADJACENT_RESEARCH_PATTERNS)
 
-    strong_matches = sum(
-        1
-        for pattern in STRONG_RESEARCH_PATTERNS
-        if re.search(pattern, text, re.IGNORECASE)
-    )
-
-    adjacent_matches = sum(
-        1
-        for pattern in ADJACENT_PATTERNS
-        if re.search(pattern, text, re.IGNORECASE)
-    )
-
-    # At least one strong target term.
-    #
-    # Generic AI / ML alone should NOT pass.
-    if strong_matches >= 1:
+    # Very strong direct match
+    if strong_count >= 1:
         return True
 
-    # Two adjacent terms can also pass.
-    if adjacent_matches >= 2:
+    # Broader adjacent opportunity
+    if adjacent_count >= 2:
         return True
 
     return False
 
 
 # ==============================================================================
-# URL / UID
+# UTILS
 # ==============================================================================
 
-def canonicalize_url(url):
-    if not url:
+def normalize_text(text):
+    if not text:
         return ""
 
-    url = html.unescape(str(url)).strip()
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text)
 
-    # Remove common tracking parameters.
-    url = re.sub(
-        r"([?&])(utm_[^=&]+|fbclid|gclid)=[^&]*",
-        "",
-        url,
-        flags=re.IGNORECASE,
-    )
-
-    url = re.sub(r"[?&]+$", "", url)
-
-    return url
+    return text.strip()
 
 
-def make_uid(position):
-    url = canonicalize_url(position.get("url", ""))
-
-    title = normalize_whitespace(
-        position.get("title", "")
-    ).lower()
-
-    source = normalize_whitespace(
-        position.get("source", "")
-    ).lower()
-
-    raw = f"{url}|{title}|{source}"
+def make_uid(title, url, source):
+    raw = f"{source}|{title}|{url}"
 
     return hashlib.sha256(
         raw.encode("utf-8")
     ).hexdigest()
 
 
-# ==============================================================================
-# DATE
-# ==============================================================================
-
-def is_recent(dt_value, max_days=MAX_POST_AGE_DAYS):
-    if not dt_value:
-        return True
-
-    try:
-        if isinstance(dt_value, datetime):
-            dt = dt_value
-        else:
-            dt = datetime.fromisoformat(
-                str(dt_value).replace("Z", "+00:00")
-            )
-
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-
-        now = datetime.now(timezone.utc)
-
-        return (now - dt) <= timedelta(days=max_days)
-
-    except Exception:
-        return True
-
-
-# ==============================================================================
-# SEEN DATABASE
-# ==============================================================================
-
 def load_seen():
-    os.makedirs(DATA_DIR, exist_ok=True)
-
     if not os.path.exists(SEEN_FILE):
         return set()
 
@@ -432,98 +322,246 @@ def load_seen():
 
 
 def save_seen(seen):
-    os.makedirs(DATA_DIR, exist_ok=True)
-
     try:
         with open(SEEN_FILE, "w", encoding="utf-8") as f:
             json.dump(
-                sorted(list(seen)),
+                sorted(seen),
                 f,
                 ensure_ascii=False,
                 indent=2,
             )
 
+        print(f"💾 Seen DB saved: {len(seen)} entries")
+
     except Exception as e:
-        print(f"❌ Could not save seen DB: {e}")
+        print(f"⚠️ Could not save seen DB: {e}")
 
 
-def mark_seen(position, seen):
-    seen.add(make_uid(position))
+def is_recent(dt, days=TELEGRAM_DAYS_BACK):
+    if not dt:
+        return True
 
-
-# ==============================================================================
-# JSON EXTRACTION
-# ==============================================================================
-
-def extract_json(text):
-    if not text:
-        return None
-
-    text = text.strip()
-
-    # Remove markdown code fences.
-    text = re.sub(r"^```json\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"^```\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-
-    # First attempt: direct JSON.
     try:
-        return json.loads(text)
+        if dt.endswith("Z"):
+            dt = dt[:-1] + "+00:00"
+
+        parsed = datetime.fromisoformat(dt)
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+        return parsed >= cutoff
+
     except Exception:
-        pass
-
-    # Try extracting object.
-    obj_match = re.search(
-        r"\{.*\}",
-        text,
-        flags=re.DOTALL,
-    )
-
-    if obj_match:
-        try:
-            return json.loads(obj_match.group(0))
-        except Exception:
-            pass
-
-    # Try extracting array.
-    arr_match = re.search(
-        r"\[.*\]",
-        text,
-        flags=re.DOTALL,
-    )
-
-    if arr_match:
-        try:
-            return json.loads(arr_match.group(0))
-        except Exception:
-            pass
-
-    return None
+        return True
 
 
 # ==============================================================================
-# GEMINI REQUEST HELPER
+# TELEGRAM SCRAPER
 # ==============================================================================
+
+def scrape_telegram_channel(channel):
+    url = f"https://t.me/s/{channel}"
+
+    try:
+        response = requests.get(
+            url,
+            headers=TELEGRAM_HEADERS,
+            timeout=20,
+        )
+
+        if response.status_code != 200:
+            print(
+                f"   ⚠️ Telegram HTTP {response.status_code}"
+            )
+            return []
+
+        page = response.text
+
+    except Exception as e:
+        print(f"   ⚠️ Telegram request failed: {e}")
+        return []
+
+    results = []
+
+    # Telegram post blocks
+    blocks = re.findall(
+        r'<div class="tgme_widget_message_wrap".*?</div>\s*</div>',
+        page,
+        flags=re.DOTALL,
+    )
+
+    # Fallback if HTML structure differs
+    if not blocks:
+        blocks = re.findall(
+            r'<div class="tgme_widget_message".*?</div>\s*</div>',
+            page,
+            flags=re.DOTALL,
+        )
+
+    for block in blocks:
+
+        # Post URL
+        url_match = re.search(
+            r'href="(https://t\.me/[^"]+)"',
+            block,
+        )
+
+        if not url_match:
+            continue
+
+        post_url = html.unescape(url_match.group(1))
+
+        # Text
+        text_match = re.search(
+            r'<div class="tgme_widget_message_text[^>]*>(.*?)</div>',
+            block,
+            flags=re.DOTALL,
+        )
+
+        text = ""
+
+        if text_match:
+            text = re.sub(
+                r"<br\s*/?>",
+                "\n",
+                text_match.group(1),
+            )
+
+            text = re.sub(
+                r"<[^>]+>",
+                " ",
+                text,
+            )
+
+            text = normalize_text(text)
+
+        # Date
+        date_match = re.search(
+            r'<time[^>]+datetime="([^"]+)"',
+            block,
+        )
+
+        post_date = None
+
+        if date_match:
+            post_date = date_match.group(1)
+
+        if not is_recent(post_date):
+            continue
+
+        if not text:
+            continue
+
+        # Use first line as rough title
+        lines = [
+            x.strip()
+            for x in text.split("\n")
+            if x.strip()
+        ]
+
+        title = lines[0][:250] if lines else text[:250]
+
+        if not local_candidate_filter(title, text):
+            continue
+
+        uid = make_uid(
+            title,
+            post_url,
+            f"telegram:{channel}",
+        )
+
+        results.append({
+            "uid": uid,
+            "title": title,
+            "description": text[:5000],
+            "url": post_url,
+            "source": f"Telegram @{channel}",
+            "type": "telegram",
+        })
+
+    return results
+
+
+def collect_telegram_candidates(seen):
+    candidates = []
+
+    print("\n================ TELEGRAM ================\n")
+
+    for channel in TELEGRAM_CHANNELS:
+
+        print(f"📡 Scanning @{channel}...")
+
+        channel_results = scrape_telegram_channel(channel)
+
+        new_results = []
+
+        for item in channel_results:
+            if item["uid"] not in seen:
+                new_results.append(item)
+
+        print(
+            f"   ✓ {len(new_results)} relevant local candidates"
+        )
+
+        candidates.extend(new_results)
+
+        if len(candidates) >= MAX_TELEGRAM_CANDIDATES_PER_RUN:
+            break
+
+    # Deduplicate
+    unique = {}
+
+    for item in candidates:
+        unique[item["uid"]] = item
+
+    candidates = list(unique.values())
+
+    return candidates[:MAX_TELEGRAM_CANDIDATES_PER_RUN]
+
+
+# ==============================================================================
+# GEMINI
+# ==============================================================================
+
+if not GEMINI_API_KEY:
+    print("❌ GEMINI_API_KEY is not configured.")
+    raise SystemExit(1)
+
+
+client = genai.Client(
+    api_key=GEMINI_API_KEY
+)
+
+GEMINI_QUOTA_EXHAUSTED = False
+
 
 def gemini_generate(
     model,
     contents,
     config=None,
-    retries=2,
+    retries=GEMINI_MAX_RETRIES,
 ):
+    """
+    Central Gemini API wrapper.
+
+    Important:
+    - 503 -> retry
+    - 429 / RESOURCE_EXHAUSTED / quota -> stop
+    """
+
     global GEMINI_QUOTA_EXHAUSTED
 
     if GEMINI_QUOTA_EXHAUSTED:
         return None
 
-    if ai_client is None:
-        print("❌ Gemini client is not configured.")
-        return None
-
     for attempt in range(retries + 1):
 
         try:
-            response = ai_client.models.generate_content(
+
+            response = client.models.generate_content(
                 model=model,
                 contents=contents,
                 config=config,
@@ -533,634 +571,266 @@ def gemini_generate(
 
         except Exception as e:
 
-            error_text = str(e).lower()
+            error_text = str(e)
 
-            # ----------------------------------------------------------
-            # Quota: DO NOT RETRY
-            # ----------------------------------------------------------
+            print(
+                f"   ⚠️ Gemini error "
+                f"(attempt {attempt + 1}/{retries + 1}): "
+                f"{error_text[:700]}"
+            )
 
+            lower = error_text.lower()
+
+            # Quota / rate limit
             if (
-                "429" in error_text
-                or "resource_exhausted" in error_text
-                or "quota" in error_text
+                "429" in lower
+                or "resource_exhausted" in lower
+                or "quota" in lower
             ):
                 GEMINI_QUOTA_EXHAUSTED = True
 
                 print(
-                    "\n"
-                    "🛑 Gemini quota exhausted.\n"
-                    "Stopping all further Gemini calls for this run.\n"
+                    "\n🛑 Gemini quota/rate limit exhausted."
                 )
 
                 return None
 
-            # ----------------------------------------------------------
-            # Temporary overload: retry.
-            # ----------------------------------------------------------
-
+            # Temporary server overload
             if (
-                "503" in error_text
-                or "unavailable" in error_text
-                or "high demand" in error_text
+                "503" in lower
+                or "unavailable" in lower
+                or "high demand" in lower
             ):
                 if attempt < retries:
-                    wait_time = 2 ** (attempt + 1)
+                    wait = GEMINI_RETRY_DELAY * (attempt + 1)
 
                     print(
-                        f"⚠️ Gemini temporarily unavailable "
-                        f"(attempt {attempt + 1}/{retries + 1}). "
-                        f"Retrying in {wait_time}s..."
+                        f"   ⏳ Retrying in {wait}s..."
                     )
 
-                    time.sleep(wait_time)
+                    time.sleep(wait)
+
                     continue
 
-            print(f"❌ Gemini error: {e}")
-            return None
+            # Other errors
+            if attempt < retries:
+                time.sleep(2)
 
     return None
+
+
+# ==============================================================================
+# GEMINI BASIC API TEST
+# ==============================================================================
+
+def test_gemini_api():
+    """
+    Tiny ungrounded request.
+
+    This separates:
+      1. API key/project quota problem
+      2. Web Search grounding problem
+    """
+
+    print("\n================ GEMINI API TEST ================\n")
+
+    response = gemini_generate(
+        model=GEMINI_EVAL_MODEL,
+        contents="Reply with exactly: GEMINI_OK",
+        config=types.GenerateContentConfig(),
+        retries=0,
+    )
+
+    if response is None:
+        print(
+            "❌ Basic Gemini API test FAILED."
+        )
+
+        print(
+            "   The problem is likely API quota/billing/project configuration."
+        )
+
+        return False
+
+    text = getattr(response, "text", "")
+
+    print("✅ Basic Gemini API test PASSED.")
+    print(f"   Response: {text}")
+
+    return True
 
 
 # ==============================================================================
 # GEMINI WEB SEARCH
 # ==============================================================================
 
-def gemini_web_search(task_name, search_query):
-    global GEMINI_QUOTA_EXHAUSTED
+WEB_SEARCH_TASKS = [
+    {
+        "name": "Core VIO / SLAM",
+        "query": """
+Find current PhD / doctoral positions for Fall 2027 or upcoming intake
+in Visual-Inertial Odometry, VIO, Visual SLAM, SLAM, Visual Odometry,
+Localization, Pose Estimation, or State Estimation.
 
+Focus on funded PhD positions in universities and research labs.
+Prioritize robotics, autonomous systems, computer vision and navigation.
+Exclude postdocs, internships, master's-only positions and unrelated fields.
+""",
+    },
+
+    {
+        "name": "Navigation / Localization",
+        "query": """
+Find current funded PhD / doctoral opportunities for Fall 2027 or upcoming intake
+in robot localization, autonomous navigation, visual navigation,
+robot navigation, state estimation, sensor fusion, or mobile robotics.
+
+Prioritize positions involving cameras, IMU, LiDAR, GNSS, robotics,
+or autonomous systems.
+Exclude postdoctoral, internship, master's-only and unrelated positions.
+""",
+    },
+
+    {
+        "name": "Robotics / Perception",
+        "query": """
+Find funded PhD / doctoral positions for Fall 2027 or upcoming intake
+in robotics perception, 3D vision, computer vision for robotics,
+robot perception, 3D reconstruction, LiDAR-camera-IMU systems,
+visual localization, or autonomous systems.
+
+Prioritize research relevant to SLAM, VIO, localization, navigation
+and sensor fusion.
+Exclude unrelated biology, chemistry, materials and mechanical engineering.
+""",
+    },
+
+    {
+        "name": "GNSS / Sensor Fusion",
+        "query": """
+Find funded PhD / doctoral positions for Fall 2027 or upcoming intake
+in GNSS, GPS, GNSS/INS, inertial navigation, sensor fusion,
+multi-sensor positioning, localization, navigation or state estimation.
+
+Prioritize research combining GNSS/INS with cameras, LiDAR,
+robotics, autonomous systems or machine learning.
+Exclude master's-only, internships and unrelated engineering fields.
+""",
+    },
+
+    {
+        "name": "Visual Navigation / Autonomous Systems",
+        "query": """
+Find funded PhD / doctoral positions for Fall 2027 or upcoming intake
+in visual navigation, autonomous navigation, robot localization,
+visual perception, computer vision for autonomous systems,
+SLAM, VIO, sensor fusion or mobile robotics.
+
+Search university PhD vacancy pages, laboratory pages,
+professor/project pages and official doctoral advertisements.
+Prioritize direct research matches to VIO/SLAM/navigation.
+Exclude postdocs, internships and master's-only positions.
+""",
+    },
+]
+
+
+def gemini_web_search(task):
     if GEMINI_QUOTA_EXHAUSTED:
         return []
 
-    if ai_client is None:
-        return []
-
     print(
-        f"\n🌐 Gemini Web Search: {task_name}"
+        f"\n🌐 Gemini Web Search: {task['name']}"
     )
 
     grounding_tool = types.Tool(
         google_search=types.GoogleSearch()
     )
 
+    # IMPORTANT:
+    # Gemini 3.8 Flash does NOT use temperature here.
     config = types.GenerateContentConfig(
         tools=[grounding_tool],
-        temperature=0.1,
     )
-
-    prompt = f"""
-Find current funded PhD opportunities relevant to this candidate.
-
-SEARCH TASK:
-{task_name}
-
-SEARCH QUERY:
-{search_query}
-
-Candidate target:
-- Direct funded PhD
-- Fall 2027 or starting during 2027
-- VIO
-- visual SLAM
-- visual odometry
-- visual navigation
-- visual localization
-- sensor fusion
-- GNSS / GNSS-INS
-- inertial navigation
-- robot localization
-- state estimation
-- autonomous navigation
-- robotics perception
-- LiDAR / camera / IMU fusion
-- 3D computer vision
-
-Search the live web.
-
-Prioritize:
-1. Official university PhD/project pages
-2. FindAPhD
-3. EURAXESS
-4. Official research group / supervisor pages
-
-Avoid:
-- Master programs
-- Bachelor's programs
-- Postdocs
-- internships
-- jobs without PhD enrollment
-- clearly unrelated fields
-
-Return ONLY valid JSON:
-
-{{
-  "results": [
-    {{
-      "title": "...",
-      "university": "...",
-      "country": "...",
-      "supervisor": "...",
-      "deadline": "...",
-      "funding": "...",
-      "source": "...",
-      "url": "...",
-      "description": "...",
-      "relevance": "..."
-    }}
-  ]
-}}
-
-Maximum {MAX_RESULTS_PER_WEB_TASK} results.
-Use the actual URL of each opportunity.
-"""
 
     response = gemini_generate(
         model=GEMINI_SEARCH_MODEL,
-        contents=prompt,
+        contents=task["query"],
         config=config,
-        retries=2,
     )
 
     if response is None:
         return []
 
-    try:
-        raw_text = response.text
-    except Exception:
+    text = getattr(response, "text", "")
+
+    if not text:
         return []
 
-    data = extract_json(raw_text)
+    return parse_web_search_response(text)
 
-    if not isinstance(data, dict):
-        print("⚠️ Gemini search returned invalid JSON.")
-        return []
 
-    results = data.get("results", [])
+def parse_web_search_response(text):
+    """
+    Gemini may return ordinary prose rather than strict JSON.
+    We extract URLs and nearby context.
+    """
 
-    if not isinstance(results, list):
-        return []
+    results = []
 
-    cleaned = []
+    # Markdown links
+    markdown_links = re.findall(
+        r"\[([^\]]+)\]\((https?://[^\s\)]+)\)",
+        text,
+    )
 
-    for item in results[:MAX_RESULTS_PER_WEB_TASK]:
-
-        if not isinstance(item, dict):
-            continue
-
-        title = normalize_whitespace(
-            item.get("title", "")
-        )
-
-        url = canonicalize_url(
-            item.get("url", "")
-        )
-
-        if not title:
-            continue
-
-        cleaned.append({
-            "title": title,
-            "university": item.get("university", ""),
-            "country": item.get("country", ""),
-            "supervisor": item.get("supervisor", ""),
-            "deadline": item.get("deadline", ""),
-            "funding": item.get("funding", ""),
-            "source": item.get("source", "Gemini Web Search"),
-            "url": url,
-            "description": normalize_whitespace(
-                item.get("description", "")
-            ),
-            "research_text": normalize_whitespace(
-                item.get("relevance", "")
-            ),
+    for title, url in markdown_links:
+        results.append({
+            "title": normalize_text(title),
+            "url": url.strip(),
+            "description": text[:3000],
         })
 
-    print(
-        f"   ✓ Found {len(cleaned)} candidates"
+    # Bare URLs
+    bare_urls = re.findall(
+        r'https?://[^\s\)\]>"\'`]+',
+        text,
     )
 
-    return cleaned
+    existing_urls = {
+        x["url"]
+        for x in results
+    }
 
+    for url in bare_urls:
+        url = url.rstrip(".,;")
 
-# ==============================================================================
-# BATCH EVALUATION
-# ==============================================================================
-
-def build_batch_prompt(candidates):
-    blocks = []
-
-    for idx, candidate in enumerate(candidates, start=1):
-
-        text = f"""
-CANDIDATE {idx}
-
-Title:
-{candidate.get("title", "")}
-
-University:
-{candidate.get("university", "")}
-
-Country:
-{candidate.get("country", "")}
-
-Supervisor:
-{candidate.get("supervisor", "")}
-
-Deadline:
-{candidate.get("deadline", "")}
-
-Funding:
-{candidate.get("funding", "")}
-
-Source:
-{candidate.get("source", "")}
-
-URL:
-{candidate.get("url", "")}
-
-Description:
-{candidate.get("description", "")}
-
-Research text:
-{candidate.get("research_text", "")}
-
-Original Telegram text:
-{candidate.get("text", "")}
-"""
-
-        blocks.append(text)
-
-    joined = "\n\n".join(blocks)
-
-    return f"""
-{SYSTEM_PROMPT}
-
-Evaluate ALL candidates below.
-
-{joined}
-
-Return ONLY valid JSON in this exact structure:
-
-{{
-  "results": [
-    {{
-      "id": 1,
-      "is_relevant": true,
-      "tier": 1,
-      "confidence_score": 0.95,
-      "key_topics": ["VIO", "sensor fusion"],
-      "research_fit": "...",
-      "technical_gaps": ["..."],
-      "reason": "..."
-    }}
-  ]
-}}
-
-Rules:
-- id must correspond exactly to the candidate number.
-- confidence_score must be between 0 and 1.
-- tier must be 1, 2, 3, or 4.
-- Do not invent information.
-- Be conservative.
-- Return one result for every candidate.
-"""
-
-
-def evaluate_batch_with_gemini(candidates):
-    global GEMINI_QUOTA_EXHAUSTED
-
-    if not candidates:
-        return []
-
-    if GEMINI_QUOTA_EXHAUSTED:
-        return []
-
-    all_results = []
-
-    for start in range(
-        0,
-        len(candidates),
-        GEMINI_BATCH_SIZE,
-    ):
-
-        batch = candidates[
-            start:start + GEMINI_BATCH_SIZE
-        ]
-
-        print(
-            f"\n🧠 Gemini batch evaluation: "
-            f"{start + 1}-{start + len(batch)} "
-            f"of {len(candidates)}"
-        )
-
-        prompt = build_batch_prompt(batch)
-
-        config = types.GenerateContentConfig(
-            temperature=0.1,
-        )
-
-        response = gemini_generate(
-            model=GEMINI_EVAL_MODEL,
-            contents=prompt,
-            config=config,
-            retries=2,
-        )
-
-        if response is None:
-            print(
-                "⚠️ Batch evaluation failed. "
-                "Candidates in this batch will NOT be marked seen."
-            )
+        if url in existing_urls:
             continue
 
-        try:
-            raw_text = response.text
-        except Exception:
-            print("⚠️ Could not read Gemini response.")
-            continue
+        results.append({
+            "title": urlparse(url).netloc,
+            "url": url,
+            "description": text[:3000],
+        })
 
-        data = extract_json(raw_text)
-
-        if not isinstance(data, dict):
-            print("⚠️ Invalid JSON from batch evaluator.")
-            continue
-
-        results = data.get("results", [])
-
-        if not isinstance(results, list):
-            continue
-
-        for result in results:
-
-            if not isinstance(result, dict):
-                continue
-
-            try:
-                idx = int(result.get("id"))
-            except Exception:
-                continue
-
-            if idx < 1 or idx > len(batch):
-                continue
-
-            candidate = batch[idx - 1]
-
-            result["_candidate"] = candidate
-            result["_api_ok"] = True
-
-            all_results.append(result)
-
-        if not GEMINI_QUOTA_EXHAUSTED:
-            time.sleep(REQUEST_DELAY)
-
-    return all_results
-
-
-# ==============================================================================
-# TELEGRAM
-# ==============================================================================
-
-def extract_telegram_messages(html_text, channel):
-    soup = BeautifulSoup(
-        html_text,
-        "html.parser",
-    )
-
-    messages = []
-
-    for message in soup.select(".tgme_widget_message"):
-
-        try:
-            text_node = message.select_one(
-                ".tgme_widget_message_text"
-            )
-
-            text = (
-                text_node.get_text(
-                    " ",
-                    strip=True,
-                )
-                if text_node
-                else ""
-            )
-
-            if not text:
-                continue
-
-            date_node = message.select_one(
-                "time"
-            )
-
-            date_value = None
-
-            if date_node:
-                date_value = date_node.get(
-                    "datetime"
-                )
-
-            link_node = message.select_one(
-                ".tgme_widget_message_date"
-            )
-
-            url = ""
-
-            if link_node:
-                url = link_node.get("href", "")
-
-            messages.append({
-                "title": text[:180],
-                "text": text,
-                "url": url,
-                "source": f"Telegram @{channel}",
-                "date": date_value,
-                "university": "",
-                "country": "",
-                "supervisor": "",
-                "deadline": "",
-                "funding": "",
-                "description": text,
-                "research_text": text,
-            })
-
-        except Exception:
-            continue
-
-    return messages
-
-
-def scrape_telegram_channel(channel):
-    all_messages = []
-
-    for page in range(1, TELEGRAM_PAGES + 1):
-
-        url = (
-            f"https://t.me/s/{channel}"
-            f"?before={page * 20}"
-        )
-
-        try:
-            response = requests.get(
-                url,
-                timeout=20,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 "
-                        "(Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 "
-                        "Chrome/120 Safari/537.36"
-                    )
-                },
-            )
-
-            if response.status_code != 200:
-                print(
-                    f"⚠️ Telegram @{channel} "
-                    f"page {page}: HTTP "
-                    f"{response.status_code}"
-                )
-                continue
-
-            messages = extract_telegram_messages(
-                response.text,
-                channel,
-            )
-
-            all_messages.extend(messages)
-
-            time.sleep(REQUEST_DELAY)
-
-        except Exception as e:
-            print(
-                f"⚠️ Telegram @{channel}: {e}"
-            )
-
-    return all_messages
-
-
-def scrape_telegram():
-    candidates = []
-
-    print("\n================ TELEGRAM ================\n")
-
-    for channel in TELEGRAM_CHANNELS:
-
-        print(
-            f"📡 Scanning @{channel}..."
-        )
-
-        messages = scrape_telegram_channel(
-            channel
-        )
-
-        accepted = 0
-
-        for message in messages:
-
-            # Date filter.
-            if not is_recent(
-                message.get("date")
-            ):
-                continue
-
-            # Strong local filter.
-            if not text_matches_research(
-                message.get("text", "")
-            ):
-                continue
-
-            candidates.append(message)
-            accepted += 1
-
-        print(
-            f"   ✓ {accepted} relevant local candidates"
-        )
-
-    # Deduplicate.
+    # Deduplicate
     unique = {}
-    for candidate in candidates:
-        unique[make_uid(candidate)] = candidate
 
-    candidates = list(unique.values())
+    for item in results:
+        unique[item["url"]] = item
 
-    if len(candidates) > MAX_TELEGRAM_CANDIDATES_PER_RUN:
-        candidates = candidates[
-            :MAX_TELEGRAM_CANDIDATES_PER_RUN
-        ]
-
-    print(
-        f"\n📊 Telegram candidates after filtering: "
-        f"{len(candidates)}"
-    )
-
-    return candidates
+    return list(unique.values())[:MAX_RESULTS_PER_WEB_TASK]
 
 
-# ==============================================================================
-# WEB SEARCH
-# ==============================================================================
-
-WEB_SEARCH_TASKS = [
-    (
-        "Core VIO / SLAM",
-        (
-            "funded PhD positions 2026 2027 "
-            "visual inertial odometry OR visual SLAM "
-            "OR visual odometry OR visual localization "
-            "OR camera IMU OR VIO"
-        ),
-    ),
-
-    (
-        "Navigation / Localization",
-        (
-            "funded PhD positions 2026 2027 "
-            "robot localization OR robot navigation "
-            "OR sensor fusion OR state estimation "
-            "OR GNSS INS OR inertial navigation "
-            "OR autonomous navigation"
-        ),
-    ),
-
-    (
-        "Robotics / Perception",
-        (
-            "funded PhD positions 2026 2027 "
-            "robotics computer vision 3D perception "
-            "LiDAR camera fusion autonomous vehicles "
-            "field robotics pose estimation"
-        ),
-    ),
-
-    (
-        "GNSS / Sensor Fusion",
-        (
-            "funded PhD 2027 GNSS positioning "
-            "GNSS INS sensor fusion localization "
-            "inertial navigation robotics"
-        ),
-    ),
-
-    (
-        "Visual Navigation / Autonomous Systems",
-        (
-            "funded PhD 2027 visual navigation "
-            "visual localization autonomous robots "
-            "SLAM perception computer vision "
-            "robot navigation state estimation"
-        ),
-    ),
-]
-
-
-def scrape_with_gemini():
+def collect_web_candidates(seen):
     candidates = []
 
     print(
         "\n================ GEMINI WEB SEARCH ================\n"
     )
 
-    for task_name, query in WEB_SEARCH_TASKS[
-        :MAX_WEB_SEARCH_TASKS
-    ]:
+    for task in WEB_SEARCH_TASKS[:MAX_WEB_SEARCH_TASKS]:
 
         if GEMINI_QUOTA_EXHAUSTED:
             print(
@@ -1169,340 +839,358 @@ def scrape_with_gemini():
             )
             break
 
-        results = gemini_web_search(
-            task_name,
-            query,
-        )
+        raw_results = gemini_web_search(task)
 
-        for result in results:
+        for result in raw_results:
 
-            combined_text = " ".join([
-                result.get("title", ""),
-                result.get("description", ""),
-                result.get("research_text", ""),
-                result.get("university", ""),
-            ])
+            title = result.get("title", "")
+            description = result.get("description", "")
+            url = result.get("url", "")
 
-            # Local filtering.
-            if not text_matches_research(
-                combined_text
+            # Local filtering
+            if not local_candidate_filter(
+                title,
+                description,
             ):
                 continue
 
+            uid = make_uid(
+                title,
+                url,
+                "gemini-web",
+            )
+
+            if uid in seen:
+                continue
+
+            result["uid"] = uid
+            result["source"] = "Gemini Web Search"
+            result["type"] = "web"
+
             candidates.append(result)
 
-        time.sleep(REQUEST_DELAY)
+        print(
+            f"   ✓ {len(raw_results)} search results received"
+        )
 
-    # Deduplicate.
+    # Dedup
     unique = {}
 
-    for candidate in candidates:
-
-        uid = make_uid(candidate)
-
-        if uid not in unique:
-            unique[uid] = candidate
+    for item in candidates:
+        unique[item["uid"]] = item
 
     candidates = list(unique.values())
-
-    if len(candidates) > MAX_WEB_CANDIDATES_PER_RUN:
-        candidates = candidates[
-            :MAX_WEB_CANDIDATES_PER_RUN
-        ]
 
     print(
         f"\n📊 Web candidates after filtering: "
         f"{len(candidates)}"
     )
 
-    return candidates
+    return candidates[:MAX_WEB_CANDIDATES_PER_RUN]
+
+
+# ==============================================================================
+# BATCH EVALUATION
+# ==============================================================================
+
+EVALUATION_SYSTEM = """
+You are evaluating PhD opportunities for a candidate whose target research is:
+
+- Visual-Inertial Odometry (VIO)
+- Visual SLAM
+- SLAM
+- Visual navigation
+- Robot localization
+- State estimation
+- Sensor fusion
+- GNSS / GNSS-INS
+- Camera-IMU-LiDAR fusion
+- Robotics perception
+- Autonomous navigation
+- 3D vision for robotics
+
+Target degree:
+DIRECT FUNDED PHD.
+
+Reject:
+- Master's-only positions
+- Postdocs
+- internships
+- undergraduate positions
+- jobs without PhD enrollment
+- unrelated biology
+- medicine
+- chemistry
+- materials
+- mechanical design
+- manufacturing
+- CFD
+- unrelated social sciences
+
+Return JSON only.
+
+For each candidate return:
+
+{
+  "results": [
+    {
+      "index": 0,
+      "relevant": true,
+      "score": 0-100,
+      "reason": "short reason"
+    }
+  ]
+}
+
+Scoring:
+90-100 = direct VIO/SLAM/navigation/localization match
+75-89  = strong robotics/perception/sensor-fusion match
+60-74  = adjacent but potentially useful
+0-59   = weak or irrelevant
+
+Only mark relevant=true if it is realistically useful for this PhD target.
+"""
+
+
+def evaluate_batch(batch):
+    if GEMINI_QUOTA_EXHAUSTED:
+        return []
+
+    items_text = []
+
+    for i, item in enumerate(batch):
+
+        items_text.append(
+            f"""
+INDEX: {i}
+TITLE: {item.get('title', '')}
+SOURCE: {item.get('source', '')}
+URL: {item.get('url', '')}
+DESCRIPTION:
+{item.get('description', '')[:5000]}
+"""
+        )
+
+    prompt = (
+        EVALUATION_SYSTEM
+        + "\n\nCANDIDATES:\n"
+        + "\n---\n".join(items_text)
+    )
+
+    # IMPORTANT:
+    # No temperature for Gemini 3.8 Flash.
+    config = types.GenerateContentConfig()
+
+    response = gemini_generate(
+        model=GEMINI_EVAL_MODEL,
+        contents=prompt,
+        config=config,
+    )
+
+    if response is None:
+        return []
+
+    text = getattr(response, "text", "")
+
+    if not text:
+        return []
+
+    # Extract JSON
+    match = re.search(
+        r"\{.*\}",
+        text,
+        flags=re.DOTALL,
+    )
+
+    if not match:
+        print(
+            "   ⚠️ Could not parse Gemini evaluation JSON."
+        )
+        return []
+
+    try:
+        data = json.loads(match.group(0))
+
+    except Exception as e:
+        print(
+            f"   ⚠️ JSON parse failed: {e}"
+        )
+        return []
+
+    results = data.get("results", [])
+
+    if not isinstance(results, list):
+        return []
+
+    return results
+
+
+def evaluate_candidates(candidates):
+    if not candidates:
+        return []
+
+    print(
+        "\n================ GEMINI EVALUATION ================\n"
+    )
+
+    evaluated = []
+
+    for start in range(
+        0,
+        len(candidates),
+        GEMINI_BATCH_SIZE,
+    ):
+
+        if GEMINI_QUOTA_EXHAUSTED:
+            print(
+                "🛑 Gemini quota exhausted. "
+                "Stopping evaluation."
+            )
+            break
+
+        batch = candidates[
+            start:start + GEMINI_BATCH_SIZE
+        ]
+
+        print(
+            f"🧠 Evaluating batch "
+            f"{start + 1}-{start + len(batch)} "
+            f"of {len(candidates)}"
+        )
+
+        results = evaluate_batch(batch)
+
+        if not results:
+            continue
+
+        for result in results:
+
+            try:
+                index = int(result.get("index"))
+
+            except Exception:
+                continue
+
+            if index < 0 or index >= len(batch):
+                continue
+
+            candidate = batch[index].copy()
+
+            candidate["relevant"] = bool(
+                result.get("relevant", False)
+            )
+
+            candidate["score"] = int(
+                result.get("score", 0)
+            )
+
+            candidate["reason"] = (
+                result.get("reason", "")
+            )
+
+            evaluated.append(candidate)
+
+        time.sleep(1)
+
+    return evaluated
 
 
 # ==============================================================================
 # TELEGRAM NOTIFICATION
 # ==============================================================================
 
-def send_telegram_message(message):
-    if not BOT_TOKEN or not CHAT_ID:
-        print(
-            "⚠️ Telegram bot credentials missing."
-        )
-        return False
-
+def telegram_send_message(bot_token, chat_id, text):
     url = (
         f"https://api.telegram.org/bot"
-        f"{BOT_TOKEN}/sendMessage"
+        f"{bot_token}/sendMessage"
     )
-
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False,
-    }
 
     try:
         response = requests.post(
             url,
-            json=payload,
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "disable_web_page_preview": True,
+            },
             timeout=20,
         )
 
-        if response.status_code != 200:
-            print(
-                f"❌ Telegram send failed: "
-                f"{response.status_code} "
-                f"{response.text[:300]}"
-            )
-            return False
-
-        return True
+        return response.ok
 
     except Exception as e:
         print(
-            f"❌ Telegram send exception: {e}"
+            f"⚠️ Telegram notification failed: {e}"
         )
+
         return False
 
 
-def format_position_alert(
-    candidate,
-    evaluation,
-):
-    title = html.escape(
-        str(candidate.get("title", "Untitled"))
-    )
+def format_candidate(item):
+    title = item.get("title", "Untitled")
 
-    university = html.escape(
-        str(candidate.get("university", "") or "")
-    )
+    score = item.get("score", 0)
 
-    country = html.escape(
-        str(candidate.get("country", "") or "")
-    )
-
-    supervisor = html.escape(
-        str(candidate.get("supervisor", "") or "")
-    )
-
-    deadline = html.escape(
-        str(candidate.get("deadline", "") or "")
-    )
-
-    funding = html.escape(
-        str(candidate.get("funding", "") or "")
-    )
-
-    source = html.escape(
-        str(candidate.get("source", "") or "")
-    )
-
-    url = candidate.get("url", "")
-
-    tier = evaluation.get(
-        "tier",
-        4,
-    )
-
-    confidence = evaluation.get(
-        "confidence_score",
-        0,
-    )
-
-    topics = evaluation.get(
-        "key_topics",
-        [],
-    )
-
-    reason = evaluation.get(
+    reason = item.get(
         "reason",
-        "",
+        "Relevant PhD opportunity."
     )
 
-    research_fit = evaluation.get(
-        "research_fit",
-        "",
+    source = item.get(
+        "source",
+        "Unknown source"
     )
 
-    gaps = evaluation.get(
-        "technical_gaps",
-        [],
+    url = item.get(
+        "url",
+        ""
     )
 
-    topic_text = ", ".join(
-        str(x)
-        for x in topics
+    return (
+        f"🎓 {title}\n\n"
+        f"⭐ Score: {score}/100\n"
+        f"📌 Source: {source}\n"
+        f"🧠 {reason}\n\n"
+        f"🔗 {url}"
     )
 
-    gap_text = ", ".join(
-        str(x)
-        for x in gaps
+
+def send_notifications(results):
+    bot_token = os.getenv(
+        "TELEGRAM_BOT_TOKEN"
     )
 
-    parts = [
-        f"🎓 <b>PhD Opportunity — Tier {tier}</b>",
-        "",
-        f"<b>{title}</b>",
+    chat_id = os.getenv(
+        "TELEGRAM_CHAT_ID"
+    )
+
+    if not bot_token or not chat_id:
+        print(
+            "⚠️ Telegram bot credentials not configured."
+        )
+        return
+
+    relevant = [
+        x for x in results
+        if x.get("relevant")
     ]
 
-    if university:
-        parts.append(
-            f"🏫 {university}"
+    relevant.sort(
+        key=lambda x: x.get("score", 0),
+        reverse=True,
+    )
+
+    for item in relevant:
+
+        text = format_candidate(item)
+
+        telegram_send_message(
+            bot_token,
+            chat_id,
+            text,
         )
 
-    if country:
-        parts.append(
-            f"🌍 {country}"
-        )
-
-    if supervisor:
-        parts.append(
-            f"👤 {supervisor}"
-        )
-
-    if deadline:
-        parts.append(
-            f"⏰ Deadline: {deadline}"
-        )
-
-    if funding:
-        parts.append(
-            f"💰 Funding: {funding}"
-        )
-
-    parts.extend([
-        "",
-        f"🎯 Confidence: {confidence:.2f}",
-        f"🔬 Topics: {html.escape(topic_text)}",
-        "",
-        f"<b>Why it fits:</b> "
-        f"{html.escape(str(reason))}",
-    ])
-
-    if research_fit:
-        parts.append(
-            f"\n<b>Research fit:</b> "
-            f"{html.escape(str(research_fit))}"
-        )
-
-    if gap_text:
-        parts.append(
-            f"\n<b>Potential gaps:</b> "
-            f"{html.escape(gap_text)}"
-        )
-
-    if source:
-        parts.append(
-            f"\n📡 Source: {source}"
-        )
-
-    if url:
-        parts.append(
-            f'\n🔗 <a href="{html.escape(url)}">'
-            f"Open opportunity</a>"
-        )
-
-    return "\n".join(parts)
-
-
-# ==============================================================================
-# PROCESS EVALUATIONS
-# ==============================================================================
-
-def process_evaluation_results(
-    evaluations,
-    seen,
-):
-    sent = 0
-    rejected = 0
-    marked = 0
-
-    for evaluation in evaluations:
-
-        candidate = evaluation.get(
-            "_candidate"
-        )
-
-        if not candidate:
-            continue
-
-        # Successful API response.
-        if not evaluation.get(
-            "_api_ok",
-            False,
-        ):
-            continue
-
-        uid = make_uid(candidate)
-
-        if uid in seen:
-            continue
-
-        try:
-            tier = int(
-                evaluation.get(
-                    "tier",
-                    4,
-                )
-            )
-        except Exception:
-            tier = 4
-
-        try:
-            confidence = float(
-                evaluation.get(
-                    "confidence_score",
-                    0,
-                )
-            )
-        except Exception:
-            confidence = 0
-
-        is_relevant = bool(
-            evaluation.get(
-                "is_relevant",
-                False,
-            )
-        )
-
-        # Mark as seen ONLY after successful evaluation.
-        seen.add(uid)
-        marked += 1
-
-        if not is_relevant:
-            rejected += 1
-            continue
-
-        if tier > 2:
-            rejected += 1
-            continue
-
-        if confidence < TELEGRAM_MIN_CONFIDENCE:
-            rejected += 1
-            continue
-
-        if tier == 2 and not SEND_TIER_2:
-            rejected += 1
-            continue
-
-        message = format_position_alert(
-            candidate,
-            evaluation,
-        )
-
-        if send_telegram_message(message):
-            sent += 1
-
-            print(
-                f"   🚨 SENT Tier {tier}: "
-                f"{candidate.get('title', '')[:100]}"
-            )
-
-            time.sleep(
-                REQUEST_DELAY
-            )
-
-    return sent, rejected, marked
+        time.sleep(0.5)
 
 
 # ==============================================================================
@@ -1512,11 +1200,15 @@ def process_evaluation_results(
 def main():
 
     print(
-        "\n"
-        "====================================================\n"
-        "      PhD Opportunity Finder\n"
-        "      VIO / SLAM / Navigation / GNSS / Robotics\n"
-        "====================================================\n"
+        """
+====================================================
+
+      PhD Opportunity Finder
+
+      VIO / SLAM / Navigation / GNSS / Robotics
+
+====================================================
+"""
     )
 
     print(
@@ -1535,17 +1227,9 @@ def main():
         f"Gemini batch size: {GEMINI_BATCH_SIZE}"
     )
 
-    if not GEMINI_API_KEY:
-        print(
-            "❌ GEMINI_API_KEY is missing."
-        )
-        return
-
-    if ai_client is None:
-        print(
-            "❌ Gemini client is unavailable."
-        )
-        return
+    # --------------------------------------------------
+    # Load seen
+    # --------------------------------------------------
 
     seen = load_seen()
 
@@ -1553,46 +1237,67 @@ def main():
         f"📚 Seen DB: {len(seen)} entries"
     )
 
-    # ==================================================================
-    # TELEGRAM
-    # ==================================================================
+    # --------------------------------------------------
+    # IMPORTANT:
+    # Basic API test BEFORE scraping/searching
+    # --------------------------------------------------
 
-    telegram_candidates = scrape_telegram()
+    if not test_gemini_api():
 
-    # ==================================================================
-    # WEB SEARCH
-    # ==================================================================
+        print(
+            "\n❌ Stopping before the main workflow."
+        )
 
-    web_candidates = []
+        print(
+            "   Fix Gemini API quota/billing first."
+        )
 
-    if not GEMINI_QUOTA_EXHAUSTED:
-        web_candidates = scrape_with_gemini()
+        return
 
-    # ==================================================================
-    # MERGE / DEDUP
-    # ==================================================================
+    # --------------------------------------------------
+    # Telegram
+    # --------------------------------------------------
 
-    all_candidates = []
-
-    all_candidates.extend(
-        telegram_candidates
+    telegram_candidates = collect_telegram_candidates(
+        seen
     )
 
-    all_candidates.extend(
-        web_candidates
+    print(
+        f"\n📊 Telegram candidates after filtering: "
+        f"{len(telegram_candidates)}"
+    )
+
+    # --------------------------------------------------
+    # Web
+    # --------------------------------------------------
+
+    web_candidates = collect_web_candidates(
+        seen
+    )
+
+    # --------------------------------------------------
+    # Merge
+    # --------------------------------------------------
+
+    all_candidates = (
+        telegram_candidates
+        + web_candidates
     )
 
     unique = {}
 
-    for candidate in all_candidates:
+    for item in all_candidates:
 
-        uid = make_uid(candidate)
+        url = item.get("url", "")
 
-        if uid in seen:
+        if not url:
             continue
 
-        if uid not in unique:
-            unique[uid] = candidate
+        # URL-level deduplication
+        normalized_url = url.split("#")[0].rstrip("/")
+
+        if normalized_url not in unique:
+            unique[normalized_url] = item
 
     all_candidates = list(
         unique.values()
@@ -1618,74 +1323,114 @@ def main():
     )
 
     print(
-        "====================================================\n"
+        "===================================================="
     )
 
-    # ==================================================================
-    # BATCH GEMINI EVALUATION
-    # ==================================================================
+    if not all_candidates:
 
-    if (
-        all_candidates
-        and not GEMINI_QUOTA_EXHAUSTED
-    ):
-
-        evaluations = evaluate_batch_with_gemini(
-            all_candidates
+        print(
+            "\n⚠️ No candidates evaluated."
         )
 
-        sent, rejected, marked = (
-            process_evaluation_results(
-                evaluations,
-                seen,
+        save_seen(seen)
+
+        if GEMINI_QUOTA_EXHAUSTED:
+            print(
+                "\n🛑 Run ended because Gemini quota "
+                "was exhausted."
             )
+
+        return
+
+    # --------------------------------------------------
+    # Evaluate
+    # --------------------------------------------------
+
+    evaluated = evaluate_candidates(
+        all_candidates
+    )
+
+    # --------------------------------------------------
+    # Only mark successfully evaluated candidates
+    # as seen.
+    # --------------------------------------------------
+
+    for item in evaluated:
+        seen.add(
+            item["uid"]
         )
+
+    # --------------------------------------------------
+    # Results
+    # --------------------------------------------------
+
+    relevant = [
+        x for x in evaluated
+        if x.get("relevant")
+    ]
+
+    relevant.sort(
+        key=lambda x: x.get("score", 0),
+        reverse=True,
+    )
+
+    print(
+        f"\n✅ Evaluated: {len(evaluated)}"
+    )
+
+    print(
+        f"🎯 Relevant: {len(relevant)}"
+    )
+
+    if relevant:
 
         print(
-            "\n================ SUMMARY ================\n"
+            "\n================ TOP RESULTS ================\n"
         )
 
-        print(
-            f"Evaluated: {len(evaluations)}"
-        )
+        for item in relevant[:20]:
 
-        print(
-            f"Sent: {sent}"
-        )
+            print(
+                f"⭐ {item.get('score', 0)}/100 | "
+                f"{item.get('title', '')}"
+            )
 
-        print(
-            f"Rejected: {rejected}"
-        )
+            print(
+                f"   {item.get('url', '')}"
+            )
 
-        print(
-            f"Marked seen: {marked}"
-        )
+            print(
+                f"   {item.get('reason', '')}"
+            )
 
-    else:
+            print()
 
-        print(
-            "⚠️ No candidates evaluated."
-        )
+    # --------------------------------------------------
+    # Notifications
+    # --------------------------------------------------
 
-    # ==================================================================
-    # SAVE
-    # ==================================================================
+    send_notifications(
+        relevant
+    )
+
+    # --------------------------------------------------
+    # Save DB
+    # --------------------------------------------------
 
     save_seen(seen)
 
-    print(
-        f"\n💾 Seen DB saved: {len(seen)} entries"
-    )
-
     if GEMINI_QUOTA_EXHAUSTED:
+
         print(
             "\n🛑 Run ended because Gemini quota "
             "was exhausted."
         )
 
-    print(
-        "\n✅ Finished.\n"
-    )
+    else:
+
+        print(
+            "\n✅ Finished successfully."
+        )
 
 
 if __name__ == "__main__":
