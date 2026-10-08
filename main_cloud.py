@@ -4,6 +4,7 @@ import time
 import re
 import warnings
 import urllib.parse
+
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
@@ -21,7 +22,6 @@ warnings.filterwarnings("ignore")
 
 try:
     import cloudscraper
-
     HAS_CLOUDSCRAPER = True
 except ImportError:
     HAS_CLOUDSCRAPER = False
@@ -33,7 +33,6 @@ except ImportError:
 
 load_dotenv()
 
-# Support both naming conventions.
 BOT_TOKEN = (
     os.getenv("TG_BOT_TOKEN")
     or os.getenv("TELEGRAM_BOT_TOKEN")
@@ -45,6 +44,24 @@ CHAT_ID = (
 )
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# --------------------------------------------------------------------------
+# Google Programmable Search / Custom Search JSON API
+#
+# Add these to GitHub Secrets:
+#
+# GOOGLE_CSE_API_KEY
+# GOOGLE_CSE_ID
+#
+# They are optional. If missing, the script will still try direct scraping.
+# --------------------------------------------------------------------------
+
+GOOGLE_CSE_API_KEY = os.getenv("GOOGLE_CSE_API_KEY")
+GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
+
+GOOGLE_CSE_ENDPOINT = (
+    "https://www.googleapis.com/customsearch/v1"
+)
 
 
 # ==============================================================================
@@ -66,10 +83,24 @@ MAX_POST_AGE_DAYS = 60
 # Telegram
 PAGES_PER_CHANNEL = 5
 
-# FindAPhD
+# FindAPhD direct scraping
 FINDAPHD_MAX_PAGES_PER_QUERY = 4
 FINDAPHD_MAX_RESULTS_PER_QUERY = 20
 FINDAPHD_REQUEST_DELAY = 1.2
+
+# Google discovery
+GOOGLE_SEARCH_RESULTS_PER_QUERY = 10
+GOOGLE_SEARCH_DELAY = 1.0
+
+# Maximum number of FindAPhD opportunities evaluated in one run.
+# This protects Gemini quota.
+FINDAPHD_MAX_CANDIDATES_PER_RUN = 60
+
+# Whether to attempt direct FindAPhD pages before switching to search.
+FINDAPHD_TRY_DIRECT = True
+
+# Once FindAPhD returns 403, stop direct scraping for the rest of this run.
+FINDAPHD_STOP_DIRECT_ON_403 = True
 
 
 # ==============================================================================
@@ -138,30 +169,27 @@ CHANNELS_TO_SCRAPE = [
 # FINDAPHD CONFIGURATION
 # ==============================================================================
 
-# Direct category pages supplied by the user.
-#
-# The first two are the user's original URLs.
-# Canonical category URLs are also included as fallback.
-#
+FINDAPHD_DOMAIN = "www.findaphd.com"
+
+FINDAPHD_SEARCH_URL = (
+    "https://www.findaphd.com/phds/"
+)
+
 FINDAPHD_CATEGORY_URLS = [
     "https://www.findaphd.com/phds/engineering/?10M7o0",
     "https://www.findaphd.com/phds/computer-science/?10M7g0",
-
-    # Canonical fallbacks
     "https://www.findaphd.com/phds/engineering/",
     "https://www.findaphd.com/phds/computer-science/",
 ]
 
 
-# Search endpoint.
-FINDAPHD_SEARCH_URL = "https://www.findaphd.com/phds/"
+# ==============================================================================
+# TARGETED ACADEMIC QUERIES
+# ==============================================================================
 
-
-# Queries specifically selected for the candidate's target research.
 ACADEMIC_SEARCH_QUERIES = [
-    # --------------------------------------------------------------------------
-    # Tier 1 — Direct research match
-    # --------------------------------------------------------------------------
+
+    # Tier 1
     "visual inertial odometry",
     "visual SLAM",
     "visual navigation",
@@ -171,9 +199,7 @@ ACADEMIC_SEARCH_QUERIES = [
     "robot localization",
     "robot navigation",
 
-    # --------------------------------------------------------------------------
     # Computer vision + robotics
-    # --------------------------------------------------------------------------
     "computer vision robotics",
     "3D computer vision robotics",
     "visual perception autonomous robots",
@@ -182,39 +208,85 @@ ACADEMIC_SEARCH_QUERIES = [
     "LiDAR camera fusion",
     "visual odometry",
 
-    # --------------------------------------------------------------------------
     # Estimation / optimization
-    # --------------------------------------------------------------------------
     "factor graph optimization robotics",
     "state estimation robotics",
     "probabilistic robotics",
     "pose estimation",
     "trajectory estimation",
 
-    # --------------------------------------------------------------------------
     # Autonomous systems
-    # --------------------------------------------------------------------------
     "autonomous navigation",
     "field robotics",
     "mobile robot localization",
     "outdoor robotics",
     "autonomous vehicles",
 
-    # --------------------------------------------------------------------------
-    # ML relevant to robotics / perception
-    # --------------------------------------------------------------------------
+    # ML
     "machine learning robotics",
     "deep learning computer vision robotics",
     "self supervised visual navigation",
     "uncertainty estimation robotics",
 
-    # --------------------------------------------------------------------------
-    # Embedded / Edge AI
-    # --------------------------------------------------------------------------
+    # Embedded / Edge
     "embedded AI robotics",
     "edge AI computer vision",
     "GPU accelerated computer vision",
     "CUDA computer vision",
+]
+
+
+# Additional queries specifically for search-engine discovery.
+#
+# These are deliberately different from the FindAPhD internal search terms.
+# Google will search the FindAPhD index rather than requesting FindAPhD directly.
+FINDAPHD_DISCOVERY_QUERIES = [
+
+    'site:findaphd.com/phds/ "visual inertial odometry"',
+    'site:findaphd.com/phds/ "visual SLAM"',
+    'site:findaphd.com/phds/ "visual navigation"',
+    'site:findaphd.com/phds/ "sensor fusion" localization',
+    'site:findaphd.com/phds/ "GNSS" positioning',
+    'site:findaphd.com/phds/ "GNSS" navigation',
+    'site:findaphd.com/phds/ "robot localization"',
+    'site:findaphd.com/phds/ "robot navigation"',
+    'site:findaphd.com/phds/ "computer vision" robotics',
+    'site:findaphd.com/phds/ "3D computer vision"',
+    'site:findaphd.com/phds/ "visual perception"',
+    'site:findaphd.com/phds/ "visual localization"',
+    'site:findaphd.com/phds/ "camera IMU"',
+    'site:findaphd.com/phds/ "LiDAR" vision',
+    'site:findaphd.com/phds/ "visual odometry"',
+    'site:findaphd.com/phds/ "factor graph" robotics',
+    'site:findaphd.com/phds/ "state estimation" robotics',
+    'site:findaphd.com/phds/ "pose estimation" robotics',
+    'site:findaphd.com/phds/ "trajectory estimation"',
+    'site:findaphd.com/phds/ "autonomous navigation"',
+    'site:findaphd.com/phds/ "field robotics"',
+    'site:findaphd.com/phds/ "mobile robot" localization',
+    'site:findaphd.com/phds/ "autonomous vehicle"',
+    'site:findaphd.com/phds/ "self-driving"',
+    'site:findaphd.com/phds/ "machine learning" robotics',
+    'site:findaphd.com/phds/ "deep learning" "computer vision"',
+    'site:findaphd.com/phds/ "uncertainty estimation" robotics',
+    'site:findaphd.com/phds/ "embedded AI" robotics',
+    'site:findaphd.com/phds/ "edge AI" robotics',
+
+    # Broader queries useful for vacancies whose title is generic.
+    'site:findaphd.com/phds/ "autonomous systems" robotics',
+    'site:findaphd.com/phds/ "robot perception"',
+    'site:findaphd.com/phds/ "localization" "computer vision"',
+    'site:findaphd.com/phds/ "navigation" "computer vision"',
+]
+
+
+# Latest PhD discovery.
+FINDAPHD_LATEST_DISCOVERY_QUERIES = [
+    'site:findaphd.com/phds/latest/ "robotics"',
+    'site:findaphd.com/phds/latest/ "computer vision"',
+    'site:findaphd.com/phds/latest/ "autonomous"',
+    'site:findaphd.com/phds/latest/ "navigation"',
+    'site:findaphd.com/phds/latest/ "sensor fusion"',
 ]
 
 
@@ -224,10 +296,7 @@ ACADEMIC_SEARCH_QUERIES = [
 
 BROAD_PATTERNS = [
 
-    # ==========================================================================
-    # Tier 1 — Direct Research Match
-    # ==========================================================================
-
+    # VIO / SLAM / Navigation
     r"\bv[io]\b",
     r"visual[- ]inertial",
     r"visual[- ]inertial odometry",
@@ -235,13 +304,13 @@ BROAD_PATTERNS = [
     r"visual odometry",
     r"visual[- ]inertial navigation",
     r"visual navigation",
-
     r"\bslam\b",
     r"visual slam",
     r"visual[- ]inertial slam",
     r"simultaneous localization and mapping",
     r"localization and mapping",
 
+    # Sensor fusion
     r"sensor fusion",
     r"multi[- ]sensor fusion",
     r"multimodal sensor fusion",
@@ -251,6 +320,7 @@ BROAD_PATTERNS = [
     r"gnss/imu",
     r"gnss fusion",
 
+    # GNSS / positioning
     r"\bgnss\b",
     r"gps positioning",
     r"gnss positioning",
@@ -261,10 +331,7 @@ BROAD_PATTERNS = [
     r"localization",
     r"positioning",
 
-    # ==========================================================================
-    # Computer Vision
-    # ==========================================================================
-
+    # Computer vision
     r"computer vision",
     r"machine vision",
     r"3d vision",
@@ -282,10 +349,7 @@ BROAD_PATTERNS = [
     r"place recognition",
     r"camera[- ]based navigation",
 
-    # ==========================================================================
     # Robotics
-    # ==========================================================================
-
     r"robot localization",
     r"robot navigation",
     r"autonomous navigation",
@@ -299,10 +363,7 @@ BROAD_PATTERNS = [
     r"autonomous vehicle",
     r"self[- ]driving",
 
-    # ==========================================================================
-    # ML / Deep Learning
-    # ==========================================================================
-
+    # ML
     r"machine learning",
     r"deep learning",
     r"neural network",
@@ -316,10 +377,7 @@ BROAD_PATTERNS = [
     r"graph neural network",
     r"\bgnn\b",
 
-    # ==========================================================================
-    # Optimization / Estimation
-    # ==========================================================================
-
+    # Estimation
     r"factor graph",
     r"factor graph optimization",
     r"graph[- ]based optimization",
@@ -332,10 +390,7 @@ BROAD_PATTERNS = [
     r"particle filter",
     r"probabilistic robotics",
 
-    # ==========================================================================
     # Sensors
-    # ==========================================================================
-
     r"\bimu\b",
     r"inertial measurement",
     r"inertial navigation",
@@ -348,10 +403,7 @@ BROAD_PATTERNS = [
     r"rtk",
     r"pseudorange",
 
-    # ==========================================================================
-    # Embedded / Edge AI
-    # ==========================================================================
-
+    # Embedded / Edge
     r"embedded ai",
     r"edge ai",
     r"edge computing",
@@ -365,15 +417,11 @@ BROAD_PATTERNS = [
     r"cuda",
     r"nvidia jetson",
     r"edge robotics",
-
     r"\bros\b",
     r"ros2",
     r"robot operating system",
 
-    # ==========================================================================
-    # Electronics / Hardware
-    # ==========================================================================
-
+    # Hardware
     r"\bfpga\b",
     r"\bsdr\b",
     r"software defined radio",
@@ -383,10 +431,7 @@ BROAD_PATTERNS = [
     r"digital systems",
     r"embedded hardware",
 
-    # ==========================================================================
-    # Position signals
-    # ==========================================================================
-
+    # PhD signals
     r"\bphd\b",
     r"ph\.d",
     r"doctoral",
@@ -429,7 +474,7 @@ EXCLUDE_PATTERNS = [
     r"ielts class",
     r"immigration lawyer",
 
-    # Medical wet-lab
+    # Wet lab / biology
     r"wet[- ]lab",
     r"molecular biology",
     r"cell culture",
@@ -451,12 +496,11 @@ EXCLUDE_PATTERNS = [
     r"robot[- ]assisted surgery",
     r"prosthetics",
     r"exoskeleton",
-
     r"pure mechanical design",
     r"fluid mechanics",
     r"thermodynamics",
 
-    # Policy / social sciences
+    # Policy / social science
     r"public policy",
     r"social sciences",
     r"political science",
@@ -507,7 +551,7 @@ sensor fusion, GNSS/INS integration, robot localization, autonomous navigation,
 computer vision for robotics, and perception for autonomous systems.
 
 Tier 1 — Direct Match:
-- Visual-Inertial Odometry (VIO)
+- Visual-Inertial Odometry
 - Visual SLAM
 - Visual navigation
 - Sensor fusion for localization/navigation
@@ -563,46 +607,35 @@ Tier 4 — Weak/Conditional Match:
 - General IoT
 - General autonomous systems
 
-These should receive a lower score unless the vacancy connects them to
-navigation, robotics, perception, localization, or sensor fusion.
+Important:
+Research topic and expected work are more important than the list of tools.
+Do not consider a vacancy highly relevant merely because it contains generic
+terms such as AI, Machine Learning, Python, or Robotics.
 
-Disqualifiers — REJECT:
+A robotics position is a strong match if it involves localization, perception,
+navigation, SLAM, sensor fusion, or autonomous systems.
+
+A computer vision position is a strong match if it involves robotics,
+navigation, localization, 3D vision, or autonomous systems.
+
+A GNSS position is a strong match even if it does not mention deep learning.
+
+Prefer funded PhD / doctoral research positions.
+
+Reject:
 - Pure mechanical engineering
-- Pure robotic manipulation / robotic arms without perception or localization
-- Prosthetics / exoskeletons unless strongly focused on sensing, perception or navigation
+- Pure robotic manipulation without perception/localization
+- Prosthetics / exoskeletons unless strongly sensing/navigation focused
 - Medical wet-lab biology
 - Pure chemistry
 - Pure materials science
 - Pure theoretical mathematics
-- Pure telecommunications without sensing/localization relevance
+- Pure telecommunications without localization/sensing relevance
 - Pure power electronics
 - Pure control theory with no robotics/navigation application
-- Pure software engineering with no research connection to the candidate's areas
+- Pure software engineering with no research connection
 - Visa advertisements
 - Language courses
-
-Important Evaluation Rules:
-1. Do NOT consider a vacancy highly relevant merely because it contains
-   generic terms such as "AI", "Machine Learning", "Python", or "Robotics".
-2. Research topic and expected work are more important than the list of tools.
-3. A robotics position is a strong match if it involves localization,
-   perception, navigation, SLAM, sensor fusion, or autonomous systems.
-4. A computer vision position is a strong match if the work involves
-   robotics, navigation, localization, 3D vision, or autonomous systems.
-5. A GNSS position is a strong match even if it does not mention deep learning.
-6. An embedded/AI hardware position is relevant but secondary unless it
-   involves robotics, computer vision, or edge AI.
-7. Prefer funded PhD / doctoral research positions.
-8. Penalize positions where the candidate would need a completely different
-   research background.
-9. Do not reject a position simply because one listed technology is missing
-   from the candidate's current CV if the underlying research direction is
-   strongly aligned.
-10. Distinguish between "research fit" and "technical gap".
-11. If the vacancy is only broadly about AI or computer science without a
-    meaningful connection to robotics, vision, localization, navigation,
-    sensing, or autonomous systems, score it low.
-12. Prefer actual PhD research vacancies over generic postgraduate programs.
 
 Return ONLY valid JSON:
 
@@ -612,35 +645,23 @@ Return ONLY valid JSON:
   "confidence_score": 9,
   "title": "Short position title",
   "key_topics": ["topic1", "topic2", "topic3"],
-  "research_fit": "1-line explanation of research alignment",
+  "research_fit": "1-line explanation",
   "technical_gaps": ["missing skill 1"],
   "reason": "1-line final explanation"
 }
 
 Scoring:
-- 9-10: Excellent fit; directly aligned with target research
-- 7-8: Strong fit; closely related with manageable technical gaps
-- 5-6: Potential fit; adjacent research area
-- 3-4: Weak fit; significant mismatch
-- 0-2: Not relevant
+9-10 = Excellent fit
+7-8 = Strong fit
+5-6 = Potential fit
+3-4 = Weak fit
+0-2 = Not relevant
 
 Tier:
-- Tier 1 = Direct match
-- Tier 2 = Strongly adjacent
-- Tier 3 = Hardware / embedded / electronics
-- Tier 4 = Weak / conditional
-
-If the position is clearly irrelevant:
-{
-  "is_relevant": false,
-  "tier": 4,
-  "confidence_score": 1,
-  "title": "Short position title",
-  "key_topics": [],
-  "research_fit": "No meaningful alignment with the candidate's research direction.",
-  "technical_gaps": [],
-  "reason": "Position is outside the candidate's target research areas."
-}
+1 = Direct match
+2 = Strongly adjacent
+3 = Hardware / embedded
+4 = Weak / conditional
 """
 
 
@@ -685,15 +706,10 @@ def normalize_whitespace(text: str) -> str:
     if not text:
         return ""
 
-    return re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"\s+", " ", str(text)).strip()
 
 
 def canonicalize_url(url: str) -> str:
-    """
-    Normalize URLs for duplicate detection.
-    Keeps meaningful query parameters but removes tracking parameters.
-    """
-
     if not url:
         return ""
 
@@ -701,11 +717,12 @@ def canonicalize_url(url: str) -> str:
 
     parsed = urlparse(url)
 
-    # Remove fragments.
     parsed = parsed._replace(fragment="")
 
-    # Remove common tracking parameters.
-    query = parse_qs(parsed.query, keep_blank_values=True)
+    query = parse_qs(
+        parsed.query,
+        keep_blank_values=True
+    )
 
     tracking_prefixes = (
         "utm_",
@@ -718,31 +735,46 @@ def canonicalize_url(url: str) -> str:
     clean_query = {}
 
     for key, values in query.items():
+
         if key.lower().startswith(tracking_prefixes):
             continue
 
         clean_query[key] = values
 
-    new_query = urlencode(clean_query, doseq=True)
+    new_query = urlencode(
+        clean_query,
+        doseq=True
+    )
 
-    parsed = parsed._replace(query=new_query)
+    parsed = parsed._replace(
+        query=new_query
+    )
 
     result = urlunparse(parsed)
 
-    # Remove trailing slash except root.
-    if result.endswith("/") and parsed.path not in ("", "/"):
+    if (
+        result.endswith("/")
+        and parsed.path not in ("", "/")
+    ):
         result = result[:-1]
 
     return result
 
 
-def make_findaphd_uid(url: str, title: str = "") -> str:
+def make_findaphd_uid(
+    url: str,
+    title: str = ""
+) -> str:
+
     canonical = canonicalize_url(url)
 
     if canonical:
         return canonical
 
-    return "findaphd:" + normalize_whitespace(title).lower()
+    return (
+        "findaphd:"
+        + normalize_whitespace(title).lower()
+    )
 
 
 # ==============================================================================
@@ -750,6 +782,7 @@ def make_findaphd_uid(url: str, title: str = "") -> str:
 # ==============================================================================
 
 def contains_excluded_pattern(text: str) -> bool:
+
     lower_t = text.lower()
 
     return any(
@@ -759,29 +792,17 @@ def contains_excluded_pattern(text: str) -> bool:
 
 
 def keyword_score(text: str) -> int:
-    """
-    Soft relevance score.
-
-    This is intentionally NOT used as a hard gate for FindAPhD.
-    """
 
     lower_t = text.lower()
 
-    score = 0
-
-    for pattern in BROAD_PATTERNS:
-        if re.search(pattern, lower_t):
-            score += 1
-
-    return score
+    return sum(
+        1
+        for pattern in BROAD_PATTERNS
+        if re.search(pattern, lower_t)
+    )
 
 
 def fast_prefilter(text: str) -> bool:
-    """
-    General filter for Telegram/RSS.
-
-    FindAPhD uses a softer version because its search snippets can be short.
-    """
 
     if not text:
         return False
@@ -792,25 +813,16 @@ def fast_prefilter(text: str) -> bool:
     return keyword_score(text) > 0
 
 
-def findaphd_soft_prefilter(title: str, description: str) -> bool:
-    """
-    FindAPhD-specific soft filter.
-
-    We don't require an exact VIO/SLAM keyword because some good vacancies
-    have generic titles such as:
-        Autonomous Systems
-        Robot Perception
-        Localization for Mobile Robots
-
-    If the title/description has at least one relevant signal, pass it to Gemini.
-    """
+def findaphd_soft_prefilter(
+    title: str,
+    description: str
+) -> bool:
 
     text = f"{title}\n{description}"
 
     if contains_excluded_pattern(text):
         return False
 
-    # Strong signals.
     strong_patterns = [
         r"visual",
         r"robot",
@@ -851,26 +863,40 @@ def findaphd_soft_prefilter(title: str, description: str) -> bool:
 # ==============================================================================
 
 def is_recent_date(dt_obj) -> bool:
+
     if not dt_obj:
         return True
 
     try:
+
         now = datetime.now(timezone.utc)
 
         if dt_obj.tzinfo is None:
-            dt_obj = dt_obj.replace(tzinfo=timezone.utc)
+            dt_obj = dt_obj.replace(
+                tzinfo=timezone.utc
+            )
 
-        return (now - dt_obj) <= timedelta(days=MAX_POST_AGE_DAYS)
+        return (
+            now - dt_obj
+        ) <= timedelta(
+            days=MAX_POST_AGE_DAYS
+        )
 
     except Exception:
         return True
 
 
 def parse_iso_time(time_str: str):
+
     try:
+
         return datetime.fromisoformat(
-            time_str.replace("Z", "+00:00")
+            time_str.replace(
+                "Z",
+                "+00:00"
+            )
         )
+
     except Exception:
         return None
 
@@ -879,7 +905,10 @@ def parse_iso_time(time_str: str):
 # GEMINI JSON
 # ==============================================================================
 
-def extract_clean_json(raw_text: str) -> dict:
+def extract_clean_json(
+    raw_text: str
+) -> dict:
+
     if not raw_text:
         return {
             "is_relevant": False,
@@ -887,6 +916,7 @@ def extract_clean_json(raw_text: str) -> dict:
         }
 
     try:
+
         start_idx = raw_text.find("{")
         end_idx = raw_text.rfind("}")
 
@@ -895,8 +925,11 @@ def extract_clean_json(raw_text: str) -> dict:
             and end_idx != -1
             and end_idx >= start_idx
         ):
+
             return json.loads(
-                raw_text[start_idx:end_idx + 1]
+                raw_text[
+                    start_idx:end_idx + 1
+                ]
             )
 
     except Exception:
@@ -908,7 +941,16 @@ def extract_clean_json(raw_text: str) -> dict:
     }
 
 
-def evaluate_with_gemini(text: str) -> dict:
+def evaluate_with_gemini(
+    text: str
+) -> dict:
+
+    if not GEMINI_API_KEY:
+
+        return {
+            "is_relevant": False,
+            "reason": "GEMINI_API_KEY missing"
+        }
 
     models_to_try = [
         "gemini-3.1-flash-lite",
@@ -921,25 +963,17 @@ def evaluate_with_gemini(text: str) -> dict:
 
             try:
 
-                response = ai_client.models.generate_content(
-                    model=model_name,
-                    contents=(
-                        "Evaluate this PhD post:\n\n"
-                        f"{text[:6000]}"
-                    ),
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT,
-                        temperature=0.1,
-                        safety_settings=[
-                            types.SafetySetting(
-                                category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                                threshold=types.HarmBlockThreshold.BLOCK_NONE
-                            ),
-                            types.SafetySetting(
-                                category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                                threshold=types.HarmBlockThreshold.BLOCK_NONE
-                            ),
-                        ]
+                response = (
+                    ai_client.models.generate_content(
+                        model=model_name,
+                        contents=(
+                            "Evaluate this PhD post:\n\n"
+                            f"{text[:7000]}"
+                        ),
+                        config=types.GenerateContentConfig(
+                            system_instruction=SYSTEM_PROMPT,
+                            temperature=0.1,
+                        )
                     )
                 )
 
@@ -949,12 +983,18 @@ def evaluate_with_gemini(text: str) -> dict:
                     not response.candidates
                     or not response.candidates[0].content.parts
                 ):
+
                     return {
                         "is_relevant": False,
-                        "reason": "Blocked by Gemini Safety Filters"
+                        "reason": (
+                            "Blocked by Gemini "
+                            "Safety Filters"
+                        )
                     }
 
-                return extract_clean_json(response.text)
+                return extract_clean_json(
+                    response.text
+                )
 
             except Exception as e:
 
@@ -962,22 +1002,26 @@ def evaluate_with_gemini(text: str) -> dict:
 
                 if (
                     "429" in err_str
-                    or "RESOURCE_EXHAUSTED" in err_str
+                    or "RESOURCE_EXHAUSTED"
+                    in err_str
                 ):
+
                     print(
-                        "[!] Gemini rate limit. Waiting 25 seconds..."
+                        "[!] Gemini rate limit. "
+                        "Waiting 25 seconds..."
                     )
 
                     time.sleep(25)
+
                     break
 
-                else:
-                    print(
-                        f"[!] Gemini error ({model_name}): "
-                        f"{err_str[:150]}"
-                    )
+                print(
+                    f"[!] Gemini error "
+                    f"({model_name}): "
+                    f"{err_str[:180]}"
+                )
 
-                    continue
+                continue
 
     return {
         "is_relevant": False,
@@ -989,7 +1033,11 @@ def evaluate_with_gemini(text: str) -> dict:
 # TELEGRAM ALERT
 # ==============================================================================
 
-def send_alert(url: str, analysis: dict, snippet: str):
+def send_alert(
+    url: str,
+    analysis: dict,
+    snippet: str
+):
 
     if not isinstance(analysis, dict):
         return False
@@ -1000,7 +1048,11 @@ def send_alert(url: str, analysis: dict, snippet: str):
         3: "🛠 Tier 3"
     }
 
-    tier_val = analysis.get("tier", 2)
+    tier_val = analysis.get(
+        "tier",
+        2
+    )
+
     label = tier_badges.get(
         tier_val,
         "Relevant Opportunity"
@@ -1042,11 +1094,11 @@ def send_alert(url: str, analysis: dict, snippet: str):
         f'🔗 <a href="{url}">Open Vacancy / Post</a>\n'
         f"────────────────────\n"
         f"📝 <b>Preview:</b>\n"
-        f"{snippet[:500]}..."
+        f"{snippet[:700]}..."
     )
 
     endpoint = (
-        f"https://api.telegram.org/bot"
+        "https://api.telegram.org/bot"
         f"{BOT_TOKEN}/sendMessage"
     )
 
@@ -1066,22 +1118,27 @@ def send_alert(url: str, analysis: dict, snippet: str):
         )
 
         print(
-            f"[Telegram] HTTP {response.status_code}"
+            f"[Telegram] HTTP "
+            f"{response.status_code}"
         )
 
         if response.status_code != 200:
+
             print(
-                "[-] Telegram failed to send message!"
+                "[-] Telegram failed!"
             )
-            print(response.text)
+
             return False
 
         result = response.json()
 
         if not result.get("ok"):
+
             print(
-                f"[-] Telegram API error: {result}"
+                f"[-] Telegram API error: "
+                f"{result}"
             )
+
             return False
 
         print(
@@ -1116,7 +1173,9 @@ def scrape_telegram_channel_deep(
         f"https://t.me/s/{channel}"
     )
 
-    for _ in range(PAGES_PER_CHANNEL):
+    for _ in range(
+        PAGES_PER_CHANNEL
+    ):
 
         try:
 
@@ -1126,9 +1185,12 @@ def scrape_telegram_channel_deep(
             )
 
             if r.status_code != 200:
+
                 print(
-                    f"[-] Telegram HTTP {r.status_code}"
+                    f"[-] Telegram HTTP "
+                    f"{r.status_code}"
                 )
+
                 break
 
             soup = BeautifulSoup(
@@ -1155,7 +1217,9 @@ def scrape_telegram_channel_deep(
                 if not msg_id:
                     continue
 
-                raw_num = msg_id.split("/")[-1]
+                raw_num = (
+                    msg_id.split("/")[-1]
+                )
 
                 if raw_num.isdigit():
 
@@ -1179,7 +1243,9 @@ def scrape_telegram_channel_deep(
                 ):
 
                     dt = parse_iso_time(
-                        time_tag.get("datetime")
+                        time_tag.get(
+                            "datetime"
+                        )
                     )
 
                     if (
@@ -1233,7 +1299,9 @@ def scrape_telegram_channel_deep(
                     text
                 )
 
-                if analysis.get("is_relevant"):
+                if analysis.get(
+                    "is_relevant"
+                ):
 
                     send_alert(
                         f"https://t.me/{msg_id}",
@@ -1244,14 +1312,15 @@ def scrape_telegram_channel_deep(
                     print(
                         "    [✓] MATCH CONFIRMED "
                         f"(Tier {analysis.get('tier')} - "
-                        f"Score {analysis.get('confidence_score')}/10)"
+                        f"Score "
+                        f"{analysis.get('confidence_score')}/10)"
                     )
 
                 else:
 
                     print(
                         "    [-] Skipped: "
-                        f"{analysis.get('reason', 'Filtered by LLM')}"
+                        f"{analysis.get('reason', 'LLM filter')}"
                     )
 
                 mark_as_seen(
@@ -1279,7 +1348,7 @@ def scrape_telegram_channel_deep(
 
 
 # ==============================================================================
-# FINDAPHD HELPERS
+# FINDAPHD URL HELPERS
 # ==============================================================================
 
 def build_findaphd_search_url(
@@ -1330,29 +1399,22 @@ def build_findaphd_category_url(
     )
 
 
-def is_findaphd_vacancy_url(url: str) -> bool:
+def is_findaphd_vacancy_url(
+    url: str
+) -> bool:
 
     if not url:
         return False
 
     parsed = urlparse(url)
 
-    if "findaphd.com" not in parsed.netloc.lower():
+    if (
+        "findaphd.com"
+        not in parsed.netloc.lower()
+    ):
         return False
 
     path = parsed.path.lower()
-
-    # Actual vacancy pages usually contain /phds/
-    # while category/search pages also contain /phds/.
-    # We reject obvious navigation URLs.
-    bad_fragments = [
-        "/phds/engineering",
-        "/phds/computer-science",
-        "/phds/",
-        "/search",
-        "/subjects/",
-        "/universities/",
-    ]
 
     if path in (
         "",
@@ -1362,46 +1424,67 @@ def is_findaphd_vacancy_url(url: str) -> bool:
     ):
         return False
 
-    # A detail page normally has additional path depth.
-    if path.startswith("/phds/"):
+    if not path.startswith(
+        "/phds/"
+    ):
+        return False
 
-        remaining = path[len("/phds/"):]
+    remaining = path[
+        len("/phds/"):
+    ]
 
-        if "/" not in remaining:
-            return False
+    # Search/category pages usually don't have
+    # another path segment.
+    if "/" not in remaining:
+        return False
 
-        return True
+    bad_prefixes = [
+        "/phds/engineering",
+        "/phds/computer-science",
+        "/phds/discipline",
+        "/phds/latest",
+        "/phds/subject",
+        "/phds/universities",
+    ]
 
-    return False
+    if any(
+        path.startswith(p)
+        for p in bad_prefixes
+    ):
+        return False
 
+    return True
+
+
+# ==============================================================================
+# FINDAPHD LISTING PARSER
+# ==============================================================================
 
 def extract_findaphd_listing_links(
     soup: BeautifulSoup,
     base_url: str
 ):
-    """
-    Extract candidate vacancy links without depending on one CSS class.
-
-    FindAPhD's frontend can change CSS class names, so we use URL structure
-    and surrounding semantic content instead.
-    """
 
     results = {}
 
-    for a in soup.find_all("a", href=True):
+    for a in soup.find_all(
+        "a",
+        href=True
+    ):
 
-        href = a.get("href", "").strip()
+        href = a.get(
+            "href",
+            ""
+        ).strip()
 
         if not href:
             continue
 
-        absolute_url = urljoin(
-            base_url,
-            href
-        )
-
         absolute_url = canonicalize_url(
-            absolute_url
+            urljoin(
+                base_url,
+                href
+            )
         )
 
         if not is_findaphd_vacancy_url(
@@ -1419,9 +1502,6 @@ def extract_findaphd_listing_links(
         if len(title) < 10:
             continue
 
-        # Ignore generic navigation.
-        lower_title = title.lower()
-
         navigation_words = {
             "view",
             "apply",
@@ -1433,46 +1513,53 @@ def extract_findaphd_listing_links(
             "see all",
         }
 
-        if lower_title in navigation_words:
+        if title.lower() in navigation_words:
             continue
 
-        if absolute_url not in results:
-
-            results[absolute_url] = {
+        results.setdefault(
+            absolute_url,
+            {
                 "url": absolute_url,
                 "anchor_title": title
             }
+        )
 
-    return list(results.values())
+    return list(
+        results.values()
+    )
 
 
 def extract_findaphd_card_for_link(
     soup: BeautifulSoup,
     link: str
 ):
-    """
-    Find the closest meaningful container around a vacancy link.
 
-    We intentionally don't depend on a single class name.
-    """
-
-    anchor = soup.find(
-        "a",
-        href=lambda x: (
-            x
-            and canonicalize_url(
-                urljoin(
-                    "https://www.findaphd.com",
-                    x
-                )
-            ) == canonicalize_url(link)
-        )
+    canonical_link = canonicalize_url(
+        link
     )
+
+    anchor = None
+
+    for a in soup.find_all(
+        "a",
+        href=True
+    ):
+
+        candidate = canonicalize_url(
+            urljoin(
+                "https://www.findaphd.com",
+                a.get("href", "")
+            )
+        )
+
+        if candidate == canonical_link:
+
+            anchor = a
+            break
 
     if not anchor:
         return ""
 
-    # Walk upward and select a reasonably sized container.
     parent = anchor
 
     for _ in range(6):
@@ -1491,10 +1578,11 @@ def extract_findaphd_card_for_link(
 
         if 80 <= len(text) <= 5000:
 
-            # Prefer containers that have multiple links or heading-like text.
             if (
                 len(parent.find_all("a")) >= 2
-                or parent.find(["h1", "h2", "h3", "h4"])
+                or parent.find(
+                    ["h1", "h2", "h3", "h4"]
+                )
             ):
                 return text
 
@@ -1505,6 +1593,10 @@ def extract_findaphd_card_for_link(
         )
     )
 
+
+# ==============================================================================
+# FINDAPHD DIRECT DETAIL PAGE
+# ==============================================================================
 
 def parse_findaphd_detail_page(
     url: str
@@ -1530,7 +1622,7 @@ def parse_findaphd_detail_page(
 
             print(
                 f"    [-] Detail HTTP "
-                f"{response.status_code}: {url}"
+                f"{response.status_code}"
             )
 
             return result
@@ -1539,10 +1631,6 @@ def parse_findaphd_detail_page(
             response.text,
             "html.parser"
         )
-
-        # ----------------------------------------------------------------------
-        # TITLE
-        # ----------------------------------------------------------------------
 
         title_elem = (
             soup.find("h1")
@@ -1555,23 +1643,24 @@ def parse_findaphd_detail_page(
         if title_elem:
 
             if title_elem.name == "meta":
+
                 result["title"] = (
                     title_elem.get(
                         "content",
                         ""
                     ).strip()
                 )
+
             else:
-                result["title"] = normalize_whitespace(
-                    title_elem.get_text(
-                        " ",
-                        strip=True
+
+                result["title"] = (
+                    normalize_whitespace(
+                        title_elem.get_text(
+                            " ",
+                            strip=True
+                        )
                     )
                 )
-
-        # ----------------------------------------------------------------------
-        # META DESCRIPTION
-        # ----------------------------------------------------------------------
 
         meta_desc = soup.find(
             "meta",
@@ -1582,22 +1671,18 @@ def parse_findaphd_detail_page(
 
         if meta_desc:
 
-            result["description"] = normalize_whitespace(
-                meta_desc.get(
-                    "content",
-                    ""
+            result["description"] = (
+                normalize_whitespace(
+                    meta_desc.get(
+                        "content",
+                        ""
+                    )
                 )
             )
 
-        # ----------------------------------------------------------------------
-        # MAIN CONTENT
-        # ----------------------------------------------------------------------
-
         main = (
             soup.find("main")
-            or soup.find(
-                "article"
-            )
+            or soup.find("article")
             or soup.body
         )
 
@@ -1614,13 +1699,11 @@ def parse_findaphd_detail_page(
                 result["description"]
             ):
 
-                # Don't allow absurdly huge pages into Gemini.
-                result["description"] = main_text[:12000]
+                result["description"] = (
+                    main_text[:12000]
+                )
 
-        # ----------------------------------------------------------------------
-        # STRUCTURED DATA
-        # ----------------------------------------------------------------------
-
+        # JSON-LD
         for script in soup.find_all(
             "script",
             type="application/ld+json"
@@ -1635,76 +1718,55 @@ def parse_findaphd_detail_page(
 
                 data = json.loads(raw)
 
-                if isinstance(data, dict):
+                if isinstance(
+                    data,
+                    list
+                ):
+
+                    candidates = data
+
+                else:
+
+                    candidates = [data]
+
+                for item in candidates:
+
+                    if not isinstance(
+                        item,
+                        dict
+                    ):
+                        continue
 
                     if not result["title"]:
-                        result["title"] = str(
-                            data.get(
-                                "name",
-                                ""
-                            )
-                        ).strip()
 
-                    description = str(
-                        data.get(
+                        result["title"] = (
+                            str(
+                                item.get(
+                                    "name",
+                                    ""
+                                )
+                            ).strip()
+                        )
+
+                    desc = str(
+                        item.get(
                             "description",
                             ""
                         )
                     ).strip()
 
                     if (
-                        description
-                        and len(description)
-                        > len(result["description"])
-                    ):
-                        result["description"] = (
-                            description
+                        desc
+                        and len(desc)
+                        > len(
+                            result["description"]
                         )
+                    ):
+
+                        result["description"] = desc
 
             except Exception:
                 continue
-
-        # ----------------------------------------------------------------------
-        # UNIVERSITY / INSTITUTION
-        # ----------------------------------------------------------------------
-
-        university_patterns = [
-            r"university",
-            r"institution",
-            r"organisation",
-            r"organization",
-            r"department",
-        ]
-
-        for pattern in university_patterns:
-
-            elem = soup.find(
-                string=re.compile(
-                    pattern,
-                    re.I
-                )
-            )
-
-            if elem:
-
-                parent_text = normalize_whitespace(
-                    elem.parent.get_text(
-                        " ",
-                        strip=True
-                    )
-                )
-
-                if 10 <= len(parent_text) <= 250:
-
-                    result["university"] = (
-                        parent_text
-                    )
-
-                    break
-
-        # ----------------------------------------------------------------------
-        # LABEL-BASED EXTRACTION
-        # ----------------------------------------------------------------------
 
         page_text = normalize_whitespace(
             soup.get_text(
@@ -1713,23 +1775,29 @@ def parse_findaphd_detail_page(
             )
         )
 
+        # Label-based extraction.
         label_patterns = {
+
             "funding": [
                 r"funding",
                 r"funded",
                 r"studentship"
             ],
+
             "deadline": [
                 r"deadline",
                 r"application deadline"
             ],
+
             "location": [
                 r"location",
                 r"study location"
             ],
         }
 
-        for field, patterns in label_patterns.items():
+        for field, patterns in (
+            label_patterns.items()
+        ):
 
             for pattern in patterns:
 
@@ -1741,11 +1809,11 @@ def parse_findaphd_detail_page(
 
                 if match:
 
-                    value = normalize_whitespace(
-                        match.group(1)
+                    result[field] = (
+                        normalize_whitespace(
+                            match.group(1)
+                        )
                     )
-
-                    result[field] = value
 
                     break
 
@@ -1761,17 +1829,83 @@ def parse_findaphd_detail_page(
         return result
 
 
+# ==============================================================================
+# FINDAPHD DIRECT ACCESS STATE
+# ==============================================================================
+
+FINDAPHD_DIRECT_BLOCKED = False
+
+
+def findaphd_direct_get(
+    url: str
+):
+    """
+    Centralized FindAPhD request.
+
+    Once the server returns 403, we stop hammering the site.
+    """
+
+    global FINDAPHD_DIRECT_BLOCKED
+
+    if FINDAPHD_DIRECT_BLOCKED:
+        return None
+
+    try:
+
+        response = session.get(
+            url,
+            timeout=25
+        )
+
+        if response.status_code == 403:
+
+            print(
+                "    [!] FindAPhD returned HTTP 403."
+            )
+
+            if FINDAPHD_STOP_DIRECT_ON_403:
+
+                FINDAPHD_DIRECT_BLOCKED = True
+
+                print(
+                    "    [!] Direct FindAPhD access "
+                    "disabled for this run."
+                )
+
+            return None
+
+        return response
+
+    except Exception as e:
+
+        print(
+            f"    [-] FindAPhD request error: "
+            f"{e}"
+        )
+
+        return None
+
+
+# ==============================================================================
+# FINDAPHD DIRECT LISTING
+# ==============================================================================
+
 def collect_findaphd_listing(
     listing,
-    page_soup: BeautifulSoup
+    page_soup
 ):
 
     url = listing["url"]
-    anchor_title = listing["anchor_title"]
 
-    card_text = extract_findaphd_card_for_link(
-        page_soup,
-        url
+    anchor_title = listing[
+        "anchor_title"
+    ]
+
+    card_text = (
+        extract_findaphd_card_for_link(
+            page_soup,
+            url
+        )
     )
 
     detail = parse_findaphd_detail_page(
@@ -1790,42 +1924,187 @@ def collect_findaphd_listing(
 
     full_text = (
         f"Title: {title}\n"
-        f"University: {detail['university']}\n"
-        f"Location: {detail['location']}\n"
-        f"Funding: {detail['funding']}\n"
-        f"Deadline: {detail['deadline']}\n"
-        f"Description: {description}"
+        f"University: "
+        f"{detail['university']}\n"
+        f"Location: "
+        f"{detail['location']}\n"
+        f"Funding: "
+        f"{detail['funding']}\n"
+        f"Deadline: "
+        f"{detail['deadline']}\n"
+        f"Description: "
+        f"{description}"
     )
 
     return {
         "url": url,
         "title": title,
         "text": full_text,
-        "university": detail["university"],
-        "location": detail["location"],
-        "funding": detail["funding"],
-        "deadline": detail["deadline"],
+        "university": detail[
+            "university"
+        ],
+        "location": detail[
+            "location"
+        ],
+        "funding": detail[
+            "funding"
+        ],
+        "deadline": detail[
+            "deadline"
+        ],
     }
 
 
 # ==============================================================================
-# FINDAPHD SCRAPER
+# FINDAPHD CANDIDATE PROCESSOR
 # ==============================================================================
 
-def scrape_findaphd_search(
-    seen: set
-):
+def process_findaphd_candidate(
+    vacancy: dict,
+    seen: set,
+    run_seen: set,
+    source_label: str
+) -> bool:
 
-    print(
-        "\n🌍 Scanning FindAPhD keyword searches..."
+    url = vacancy.get(
+        "url",
+        ""
     )
 
-    global_seen_this_run = set()
+    title = normalize_whitespace(
+        vacancy.get(
+            "title",
+            ""
+        )
+    )
+
+    text = normalize_whitespace(
+        vacancy.get(
+            "text",
+            ""
+        )
+    )
+
+    uid = make_findaphd_uid(
+        url,
+        title
+    )
+
+    if not uid:
+        return False
+
+    if uid in seen:
+        return False
+
+    if uid in run_seen:
+        return False
+
+    run_seen.add(uid)
+
+    if not title:
+        title = "FindAPhD Opportunity"
+
+    if len(text) < 50:
+
+        print(
+            f"    [-] Too little content: "
+            f"{title[:80]}"
+        )
+
+        # We do not permanently mark malformed
+        # search results as seen.
+        return False
+
+    if not findaphd_soft_prefilter(
+        title,
+        text
+    ):
+
+        print(
+            f"    [-] Prefilter rejected: "
+            f"{title[:80]}"
+        )
+
+        mark_as_seen(
+            uid,
+            seen
+        )
+
+        return False
+
+    print(
+        f"    [+] Evaluating "
+        f"[{source_label}]: "
+        f"{title[:90]}"
+    )
+
+    analysis = evaluate_with_gemini(
+        text
+    )
+
+    if analysis.get(
+        "is_relevant"
+    ):
+
+        sent = send_alert(
+            url,
+            analysis,
+            text
+        )
+
+        print(
+            "        [✓] MATCH "
+            f"Tier {analysis.get('tier')} "
+            f"/ Score "
+            f"{analysis.get('confidence_score')}/10"
+        )
+
+        if not sent:
+            print(
+                "        [!] Telegram alert "
+                "could not be sent."
+            )
+
+    else:
+
+        print(
+            "        [-] Rejected: "
+            f"{analysis.get('reason', 'LLM filter')}"
+        )
+
+    # IMPORTANT:
+    # Only now permanently mark the opportunity as processed.
+    mark_as_seen(
+        uid,
+        seen
+    )
+
+    return True
+
+
+# ==============================================================================
+# FINDAPHD DIRECT SEARCH
+# ==============================================================================
+
+def scrape_findaphd_search_direct(
+    seen: set,
+    run_seen: set
+):
+
+    if FINDAPHD_DIRECT_BLOCKED:
+        return
+
+    print(
+        "\n  🔧 Attempting direct FindAPhD access..."
+    )
 
     for kw in ACADEMIC_SEARCH_QUERIES:
 
+        if FINDAPHD_DIRECT_BLOCKED:
+            break
+
         print(
-            f"\n  🔎 FindAPhD query: {kw}"
+            f"\n  🔎 Direct query: {kw}"
         )
 
         for page in range(
@@ -1833,30 +2112,28 @@ def scrape_findaphd_search(
             FINDAPHD_MAX_PAGES_PER_QUERY + 1
         ):
 
-            search_url = build_findaphd_search_url(
-                kw,
-                page
+            if FINDAPHD_DIRECT_BLOCKED:
+                break
+
+            search_url = (
+                build_findaphd_search_url(
+                    kw,
+                    page
+                )
             )
 
-            try:
+            resp = findaphd_direct_get(
+                search_url
+            )
 
-                resp = session.get(
-                    search_url,
-                    timeout=25
-                )
-
-            except Exception as e:
-
-                print(
-                    f"    [-] Request error: {e}"
-                )
-
+            if resp is None:
                 break
 
             if resp.status_code != 200:
 
                 print(
-                    f"    [-] HTTP {resp.status_code}"
+                    f"    [-] HTTP "
+                    f"{resp.status_code}"
                 )
 
                 break
@@ -1866,141 +2143,69 @@ def scrape_findaphd_search(
                 "html.parser"
             )
 
-            listings = extract_findaphd_listing_links(
-                soup,
-                search_url
+            listings = (
+                extract_findaphd_listing_links(
+                    soup,
+                    search_url
+                )
             )
 
             if not listings:
-
-                if page == 1:
-                    print(
-                        "    [-] No vacancy links found."
-                    )
-
                 break
 
             print(
                 f"    [>] Page {page}: "
-                f"{len(listings)} candidate links"
+                f"{len(listings)} links"
             )
-
-            processed_on_page = 0
 
             for listing in listings[
                 :FINDAPHD_MAX_RESULTS_PER_QUERY
             ]:
 
-                url = listing["url"]
-
-                uid = make_findaphd_uid(
-                    url,
-                    listing["anchor_title"]
+                vacancy = (
+                    collect_findaphd_listing(
+                        listing,
+                        soup
+                    )
                 )
 
-                if (
-                    uid in seen
-                    or uid in global_seen_this_run
-                ):
-                    continue
-
-                global_seen_this_run.add(uid)
-
-                vacancy = collect_findaphd_listing(
-                    listing,
-                    soup
+                process_findaphd_candidate(
+                    vacancy,
+                    seen,
+                    run_seen,
+                    "DIRECT"
                 )
-
-                title = vacancy["title"]
-                full_text = vacancy["text"]
-
-                if len(full_text) < 50:
-
-                    mark_as_seen(
-                        uid,
-                        seen
-                    )
-
-                    continue
-
-                # Soft filter specifically for FindAPhD.
-                if not findaphd_soft_prefilter(
-                    title,
-                    full_text
-                ):
-
-                    mark_as_seen(
-                        uid,
-                        seen
-                    )
-
-                    continue
-
-                print(
-                    f"    [+] Evaluating: "
-                    f"{title[:80]}..."
-                )
-
-                analysis = evaluate_with_gemini(
-                    full_text
-                )
-
-                if analysis.get(
-                    "is_relevant"
-                ):
-
-                    send_alert(
-                        url,
-                        analysis,
-                        full_text
-                    )
-
-                    print(
-                        "        [✓] MATCH "
-                        f"Tier {analysis.get('tier')} "
-                        f"/ Score "
-                        f"{analysis.get('confidence_score')}/10"
-                    )
-
-                else:
-
-                    print(
-                        "        [-] Rejected: "
-                        f"{analysis.get('reason', 'LLM filter')}"
-                    )
-
-                mark_as_seen(
-                    uid,
-                    seen
-                )
-
-                processed_on_page += 1
 
                 time.sleep(
                     FINDAPHD_REQUEST_DELAY
                 )
 
-            # If the page returned fewer listings than expected,
-            # it is probably the final page.
             if len(listings) < 5:
                 break
 
-    print(
-        "\n[✓] FindAPhD keyword scan complete."
-    )
 
+# ==============================================================================
+# FINDAPHD DIRECT CATEGORY
+# ==============================================================================
 
-def scrape_findaphd_categories(
-    seen: set
+def scrape_findaphd_categories_direct(
+    seen: set,
+    run_seen: set
 ):
 
+    if FINDAPHD_DIRECT_BLOCKED:
+        return
+
     print(
-        "\n📚 Scanning FindAPhD category pages..."
+        "\n  📚 Direct category discovery..."
     )
 
-    global_seen_this_run = set()
+    for base_url in (
+        FINDAPHD_CATEGORY_URLS
+    ):
 
-    for base_url in FINDAPHD_CATEGORY_URLS:
+        if FINDAPHD_DIRECT_BLOCKED:
+            break
 
         print(
             f"\n  📂 Category: {base_url}"
@@ -2011,34 +2216,24 @@ def scrape_findaphd_categories(
             FINDAPHD_MAX_PAGES_PER_QUERY + 1
         ):
 
-            page_url = build_findaphd_category_url(
-                base_url,
-                page
+            if FINDAPHD_DIRECT_BLOCKED:
+                break
+
+            page_url = (
+                build_findaphd_category_url(
+                    base_url,
+                    page
+                )
             )
 
-            try:
+            resp = findaphd_direct_get(
+                page_url
+            )
 
-                resp = session.get(
-                    page_url,
-                    timeout=25
-                )
-
-            except Exception as e:
-
-                print(
-                    f"    [-] Category request error: {e}"
-                )
-
+            if resp is None:
                 break
 
             if resp.status_code != 200:
-
-                print(
-                    f"    [-] HTTP {resp.status_code}"
-                )
-
-                # Don't keep requesting subsequent pages
-                # if the category itself is unavailable.
                 break
 
             soup = BeautifulSoup(
@@ -2046,9 +2241,11 @@ def scrape_findaphd_categories(
                 "html.parser"
             )
 
-            listings = extract_findaphd_listing_links(
-                soup,
-                page_url
+            listings = (
+                extract_findaphd_listing_links(
+                    soup,
+                    page_url
+                )
             )
 
             if not listings:
@@ -2056,104 +2253,574 @@ def scrape_findaphd_categories(
 
             print(
                 f"    [>] Page {page}: "
-                f"{len(listings)} candidate links"
+                f"{len(listings)} links"
             )
 
             for listing in listings:
 
-                url = listing["url"]
-
-                uid = make_findaphd_uid(
-                    url,
-                    listing["anchor_title"]
+                vacancy = (
+                    collect_findaphd_listing(
+                        listing,
+                        soup
+                    )
                 )
 
-                if (
-                    uid in seen
-                    or uid in global_seen_this_run
-                ):
-                    continue
-
-                global_seen_this_run.add(uid)
-
-                vacancy = collect_findaphd_listing(
-                    listing,
-                    soup
-                )
-
-                title = vacancy["title"]
-                full_text = vacancy["text"]
-
-                if len(full_text) < 50:
-
-                    mark_as_seen(
-                        uid,
-                        seen
-                    )
-
-                    continue
-
-                if not findaphd_soft_prefilter(
-                    title,
-                    full_text
-                ):
-
-                    mark_as_seen(
-                        uid,
-                        seen
-                    )
-
-                    continue
-
-                print(
-                    f"    [+] Evaluating category vacancy: "
-                    f"{title[:80]}..."
-                )
-
-                analysis = evaluate_with_gemini(
-                    full_text
-                )
-
-                if analysis.get(
-                    "is_relevant"
-                ):
-
-                    send_alert(
-                        url,
-                        analysis,
-                        full_text
-                    )
-
-                    print(
-                        "        [✓] CATEGORY MATCH "
-                        f"(Tier {analysis.get('tier')}, "
-                        f"Score {analysis.get('confidence_score')}/10)"
-                    )
-
-                else:
-
-                    print(
-                        "        [-] Rejected: "
-                        f"{analysis.get('reason', 'LLM filter')}"
-                    )
-
-                mark_as_seen(
-                    uid,
-                    seen
+                process_findaphd_candidate(
+                    vacancy,
+                    seen,
+                    run_seen,
+                    "CATEGORY"
                 )
 
                 time.sleep(
                     FINDAPHD_REQUEST_DELAY
                 )
 
-    print(
-        "\n[✓] FindAPhD category scan complete."
+
+# ==============================================================================
+# GOOGLE CUSTOM SEARCH
+# ==============================================================================
+
+def google_cse_available() -> bool:
+
+    return bool(
+        GOOGLE_CSE_API_KEY
+        and GOOGLE_CSE_ID
     )
 
+
+def google_custom_search(
+    query: str,
+    start: int = 1
+):
+
+    if not google_cse_available():
+
+        return []
+
+    params = {
+        "key": GOOGLE_CSE_API_KEY,
+        "cx": GOOGLE_CSE_ID,
+        "q": query,
+        "start": start,
+        "num": GOOGLE_SEARCH_RESULTS_PER_QUERY,
+        "safe": "off",
+    }
+
+    try:
+
+        response = session.get(
+            GOOGLE_CSE_ENDPOINT,
+            params=params,
+            timeout=25
+        )
+
+        if response.status_code != 200:
+
+            print(
+                f"    [-] Google CSE HTTP "
+                f"{response.status_code}"
+            )
+
+            try:
+                print(
+                    f"        {response.text[:300]}"
+                )
+            except Exception:
+                pass
+
+            return []
+
+        data = response.json()
+
+        if "error" in data:
+
+            print(
+                "    [-] Google CSE error: "
+                f"{data['error']}"
+            )
+
+            return []
+
+        return data.get(
+            "items",
+            []
+        )
+
+    except Exception as e:
+
+        print(
+            f"    [-] Google search error: "
+            f"{e}"
+        )
+
+        return []
+
+
+# ==============================================================================
+# FINDAPHD SEARCH RESULT PARSER
+# ==============================================================================
+
+def clean_search_snippet(
+    text: str
+) -> str:
+
+    if not text:
+        return ""
+
+    text = BeautifulSoup(
+        text,
+        "html.parser"
+    ).get_text(
+        " ",
+        strip=True
+    )
+
+    return normalize_whitespace(
+        text
+    )
+
+
+def vacancy_from_google_result(
+    item: dict
+) -> dict:
+
+    url = canonicalize_url(
+        item.get(
+            "link",
+            ""
+        )
+    )
+
+    title = normalize_whitespace(
+        item.get(
+            "title",
+            ""
+        )
+    )
+
+    snippet = clean_search_snippet(
+        item.get(
+            "snippet",
+            ""
+        )
+    )
+
+    display_link = normalize_whitespace(
+        item.get(
+            "displayLink",
+            ""
+        )
+    )
+
+    html_snippet = clean_search_snippet(
+        item.get(
+            "htmlSnippet",
+            ""
+        )
+    )
+
+    combined_snippet = (
+        snippet
+        or html_snippet
+    )
+
+    text = (
+        f"Title: {title}\n"
+        f"Source: {display_link}\n"
+        f"Search snippet: "
+        f"{combined_snippet}\n"
+        f"URL: {url}"
+    )
+
+    return {
+        "url": url,
+        "title": title,
+        "text": text,
+        "university": "",
+        "location": "",
+        "funding": "",
+        "deadline": "",
+    }
+
+
+# ==============================================================================
+# OPTIONAL DETAIL FETCH AFTER SEARCH DISCOVERY
+# ==============================================================================
+
+def enrich_findaphd_from_direct_page(
+    vacancy: dict
+) -> dict:
+
+    global FINDAPHD_DIRECT_BLOCKED
+
+    if FINDAPHD_DIRECT_BLOCKED:
+        return vacancy
+
+    url = vacancy.get(
+        "url",
+        ""
+    )
+
+    if not url:
+        return vacancy
+
+    try:
+
+        resp = findaphd_direct_get(
+            url
+        )
+
+        if resp is None:
+            return vacancy
+
+        if resp.status_code != 200:
+            return vacancy
+
+        soup = BeautifulSoup(
+            resp.text,
+            "html.parser"
+        )
+
+        title_elem = (
+            soup.find("h1")
+            or soup.find(
+                "meta",
+                property="og:title"
+            )
+        )
+
+        title = ""
+
+        if title_elem:
+
+            if title_elem.name == "meta":
+
+                title = normalize_whitespace(
+                    title_elem.get(
+                        "content",
+                        ""
+                    )
+                )
+
+            else:
+
+                title = normalize_whitespace(
+                    title_elem.get_text(
+                        " ",
+                        strip=True
+                    )
+                )
+
+        meta_desc = soup.find(
+            "meta",
+            attrs={
+                "name": "description"
+            }
+        )
+
+        meta_description = ""
+
+        if meta_desc:
+
+            meta_description = (
+                normalize_whitespace(
+                    meta_desc.get(
+                        "content",
+                        ""
+                    )
+                )
+            )
+
+        main = (
+            soup.find("main")
+            or soup.find("article")
+        )
+
+        main_text = ""
+
+        if main:
+
+            main_text = normalize_whitespace(
+                main.get_text(
+                    " ",
+                    strip=True
+                )
+            )
+
+        if not title:
+            title = vacancy.get(
+                "title",
+                ""
+            )
+
+        description = max(
+            [
+                vacancy.get(
+                    "text",
+                    ""
+                ),
+                meta_description,
+                main_text
+            ],
+            key=len
+        )
+
+        vacancy["title"] = title
+
+        vacancy["text"] = (
+            f"Title: {title}\n"
+            f"Description: "
+            f"{description[:12000]}\n"
+            f"URL: {url}"
+        )
+
+        return vacancy
+
+    except Exception:
+        return vacancy
+
+
+# ==============================================================================
+# FINDAPHD SEARCH-ENGINE DISCOVERY
+# ==============================================================================
+
+def scrape_findaphd_google_discovery(
+    seen: set,
+    run_seen: set
+):
+
+    if not google_cse_available():
+
+        print(
+            "\n  [!] Google CSE credentials "
+            "not configured."
+        )
+
+        print(
+            "  [!] FindAPhD search fallback "
+            "will be unavailable."
+        )
+
+        print(
+            "  [!] Add:"
+        )
+
+        print(
+            "      GOOGLE_CSE_API_KEY"
+        )
+
+        print(
+            "      GOOGLE_CSE_ID"
+        )
+
+        return
+
+    print(
+        "\n"
+        + "-" * 65
+    )
+
+    print(
+        "🔎 FINDAPHD INDEXED SEARCH DISCOVERY"
+    )
+
+    print(
+        "-" * 65
+    )
+
+    discovered_urls = {}
+
+    all_queries = (
+        FINDAPHD_DISCOVERY_QUERIES
+        + FINDAPHD_LATEST_DISCOVERY_QUERIES
+    )
+
+    for query in all_queries:
+
+        print(
+            f"\n  🔍 {query}"
+        )
+
+        items = google_custom_search(
+            query,
+            start=1
+        )
+
+        if not items:
+
+            print(
+                "    [-] No search results."
+            )
+
+            continue
+
+        accepted = 0
+
+        for item in items:
+
+            url = canonicalize_url(
+                item.get(
+                    "link",
+                    ""
+                )
+            )
+
+            if not is_findaphd_vacancy_url(
+                url
+            ):
+                continue
+
+            title = normalize_whitespace(
+                item.get(
+                    "title",
+                    ""
+                )
+            )
+
+            snippet = clean_search_snippet(
+                item.get(
+                    "snippet",
+                    ""
+                )
+            )
+
+            vacancy = (
+                vacancy_from_google_result(
+                    item
+                )
+            )
+
+            uid = make_findaphd_uid(
+                url,
+                title
+            )
+
+            if uid in run_seen:
+                continue
+
+            # Keep the strongest/longest result if
+            # the same project appeared in multiple queries.
+            old = discovered_urls.get(
+                uid
+            )
+
+            if old:
+
+                if len(
+                    vacancy["text"]
+                ) > len(
+                    old["text"]
+                ):
+
+                    discovered_urls[
+                        uid
+                    ] = vacancy
+
+                continue
+
+            discovered_urls[
+                uid
+            ] = vacancy
+
+            accepted += 1
+
+        print(
+            f"    [+] Accepted "
+            f"{accepted} FindAPhD URLs"
+        )
+
+        time.sleep(
+            GOOGLE_SEARCH_DELAY
+        )
+
+    print(
+        "\n  📊 Unique FindAPhD URLs discovered: "
+        f"{len(discovered_urls)}"
+    )
+
+    if not discovered_urls:
+        return
+
+    candidates_processed = 0
+
+    for uid, vacancy in (
+        discovered_urls.items()
+    ):
+
+        if (
+            candidates_processed
+            >= FINDAPHD_MAX_CANDIDATES_PER_RUN
+        ):
+
+            print(
+                "  [!] FindAPhD candidate "
+                "limit reached."
+            )
+
+            break
+
+        if uid in seen:
+            continue
+
+        title = vacancy.get(
+            "title",
+            ""
+        )
+
+        snippet_text = vacancy.get(
+            "text",
+            ""
+        )
+
+        # Search-result-level prefilter.
+        if not findaphd_soft_prefilter(
+            title,
+            snippet_text
+        ):
+
+            mark_as_seen(
+                uid,
+                seen
+            )
+
+            continue
+
+        # Try direct detail only after discovery.
+        #
+        # If GitHub gets 403, enrich function will
+        # simply keep the indexed snippet.
+        if not FINDAPHD_DIRECT_BLOCKED:
+
+            vacancy = (
+                enrich_findaphd_from_direct_page(
+                    vacancy
+                )
+            )
+
+        process_findaphd_candidate(
+            vacancy,
+            seen,
+            run_seen,
+            "GOOGLE INDEX"
+        )
+
+        candidates_processed += 1
+
+        time.sleep(
+            FINDAPHD_REQUEST_DELAY
+        )
+
+
+# ==============================================================================
+# FINDAPHD MAIN SCRAPER
+# ==============================================================================
 
 def scrape_findaphd_direct(
     seen: set
 ):
+
+    global FINDAPHD_DIRECT_BLOCKED
 
     print(
         "\n"
@@ -2161,21 +2828,90 @@ def scrape_findaphd_direct(
     )
 
     print(
-        "🌍 FINDAPHD ROBUST SCRAPER"
+        "🌍 FINDAPHD HYBRID SCRAPER"
     )
 
     print(
         "=" * 70
     )
 
-    # 1. Targeted keyword search.
-    scrape_findaphd_search(
-        seen
+    print(
+        "Strategy:"
     )
 
-    # 2. Category fallback / discovery.
-    scrape_findaphd_categories(
-        seen
+    print(
+        "  1. Direct FindAPhD access"
+    )
+
+    print(
+        "  2. Detect 403"
+    )
+
+    print(
+        "  3. Stop direct requests"
+    )
+
+    print(
+        "  4. Search-engine indexed discovery"
+    )
+
+    print(
+        "  5. Gemini evaluation"
+    )
+
+    run_seen = set()
+
+    # --------------------------------------------------------------------------
+    # DIRECT
+    # --------------------------------------------------------------------------
+
+    if FINDAPHD_TRY_DIRECT:
+
+        scrape_findaphd_search_direct(
+            seen,
+            run_seen
+        )
+
+        if not FINDAPHD_DIRECT_BLOCKED:
+
+            scrape_findaphd_categories_direct(
+                seen,
+                run_seen
+            )
+
+    # --------------------------------------------------------------------------
+    # FALLBACK / PRIMARY DISCOVERY
+    # --------------------------------------------------------------------------
+
+    if FINDAPHD_DIRECT_BLOCKED:
+
+        print(
+            "\n"
+            + "!" * 70
+        )
+
+        print(
+            "⚠️ FindAPhD direct access is blocked."
+        )
+
+        print(
+            "➡️ Switching to indexed search discovery."
+        )
+
+        print(
+            "!" * 70
+        )
+
+    else:
+
+        print(
+            "\n  🔎 Running indexed discovery "
+            "in addition to direct scraping..."
+        )
+
+    scrape_findaphd_google_discovery(
+        seen,
+        run_seen
     )
 
     print(
@@ -2260,12 +2996,15 @@ def scrape_euraxess_direct(
                     and href not in unique_jobs
                 ):
 
-                    unique_jobs[href] = title
+                    unique_jobs[
+                        href
+                    ] = title
 
             if unique_jobs:
 
                 print(
-                    f"  [>] EURAXESS ('{kw}'): "
+                    f"  [>] EURAXESS "
+                    f"('{kw}'): "
                     f"{len(unique_jobs)} listings."
                 )
 
@@ -2274,7 +3013,7 @@ def scrape_euraxess_direct(
             )[:6]:
 
                 link = (
-                    f"https://euraxess.ec.europa.eu"
+                    "https://euraxess.ec.europa.eu"
                     f"{href}"
                 )
 
@@ -2302,14 +3041,18 @@ def scrape_euraxess_direct(
                                 "div",
                                 class_="node__content"
                             )
-                            or jsoup.find("main")
+                            or jsoup.find(
+                                "main"
+                            )
                         )
 
                         if desc_div:
 
-                            job_desc = desc_div.get_text(
-                                separator="\n",
-                                strip=True
+                            job_desc = (
+                                desc_div.get_text(
+                                    separator="\n",
+                                    strip=True
+                                )
                             )
 
                 except Exception:
@@ -2332,7 +3075,7 @@ def scrape_euraxess_direct(
                     continue
 
                 print(
-                    f"[+] Evaluating EURAXESS vacancy: "
+                    f"[+] Evaluating EURAXESS: "
                     f"{title[:55]}..."
                 )
 
@@ -2375,27 +3118,15 @@ def scrape_euraxess_direct(
 
 NEW_ACADEMIC_PORTALS = [
 
-    # --------------------------------------------------------------------------
-    # UK
-    # --------------------------------------------------------------------------
-
     "https://www.jobs.ac.uk/feeds/subject-areas/electrical-and-electronic-engineering",
 
     "https://www.jobs.ac.uk/feeds/subject-areas/computer-science",
-
-    # --------------------------------------------------------------------------
-    # Netherlands
-    # --------------------------------------------------------------------------
 
     "https://www.academictransfer.com/en/jobs/rss/?q=PhD+robotics",
 
     "https://www.academictransfer.com/en/jobs/rss/?q=PhD+computer+vision",
 
     "https://www.academictransfer.com/en/jobs/rss/?q=PhD+navigation",
-
-    # --------------------------------------------------------------------------
-    # European / International
-    # --------------------------------------------------------------------------
 
     "https://academicpositions.com/feed/rss?field=computer-science-electrical-engineering",
 
@@ -2509,7 +3240,7 @@ def scrape_academic_rss_feeds(
                     continue
 
                 print(
-                    f"[+] Evaluating Academic Vacancy: "
+                    f"[+] Evaluating Academic: "
                     f"{entry.get('title', '')[:55]}..."
                 )
 
@@ -2530,7 +3261,8 @@ def scrape_academic_rss_feeds(
                     print(
                         "    [✓] MATCH CONFIRMED "
                         f"(Tier {analysis.get('tier')} - "
-                        f"Score {analysis.get('confidence_score')}/10)"
+                        f"Score "
+                        f"{analysis.get('confidence_score')}/10)"
                     )
 
                 else:
@@ -2548,8 +3280,8 @@ def scrape_academic_rss_feeds(
         except Exception as e:
 
             print(
-                f"  [-] Academic feed error for "
-                f"'{feed_url[:60]}...': {e}"
+                f"  [-] Academic feed error: "
+                f"{feed_url[:60]}...: {e}"
             )
 
 
@@ -2560,7 +3292,7 @@ def scrape_academic_rss_feeds(
 def test_telegram():
 
     endpoint = (
-        f"https://api.telegram.org/bot"
+        "https://api.telegram.org/bot"
         f"{BOT_TOKEN}/sendMessage"
     )
 
@@ -2613,7 +3345,32 @@ def main():
     )
 
     # --------------------------------------------------------------------------
-    # 1. Telegram Channels
+    # Google Search status
+    # --------------------------------------------------------------------------
+
+    print(
+        "\n🔎 FindAPhD discovery configuration:"
+    )
+
+    if google_cse_available():
+
+        print(
+            "   [✓] Google CSE configured"
+        )
+
+    else:
+
+        print(
+            "   [!] Google CSE NOT configured"
+        )
+
+        print(
+            "   → Direct FindAPhD only"
+            " unless credentials are added."
+        )
+
+    # --------------------------------------------------------------------------
+    # 1. Telegram
     # --------------------------------------------------------------------------
 
     print(
@@ -2679,7 +3436,7 @@ def main():
     )
 
     # --------------------------------------------------------------------------
-    # 4. RSS Academic Portals
+    # 4. RSS
     # --------------------------------------------------------------------------
 
     print(
