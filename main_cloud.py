@@ -29,20 +29,20 @@ TELEGRAM_CHANNELS = [
     "PargarPositions",
 ]
 
-# کلیدواژه‌های جستجوی مستقیم در FindAPhD
+# کلیدواژه‌های جستجوی تخصصی در FindAPhD
 FINDAPHD_QUERIES = [
     "Visual Inertial Odometry",
     "Visual SLAM",
     "Robot Localization",
     "Autonomous Navigation",
-    "Sensor Fusion Robotics",
-    "GNSS INS Navigation",
+    "Sensor Fusion",
+    "State Estimation Robotics",
 ]
 
 SEEN_FILE = "seen_professors.json"
 
 # ----------------------------------------------------------------------
-# Gemini Configuration (تنها برای ارزیابی متن و امتیازدهی)
+# Gemini Configuration (صرفاً برای ارزیابی و امتیازدهی)
 # ----------------------------------------------------------------------
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -60,8 +60,8 @@ GEMINI_BATCH_SIZE = 10
 MAX_TELEGRAM_CANDIDATES_PER_RUN = 30
 MAX_FINDAPHD_CANDIDATES_PER_RUN = 30
 
-# بررسی پست‌های تا ۴۵ روز گذشته
-TELEGRAM_DAYS_BACK = 45
+# بررسی پست‌های تا ۶۰ روز گذشته
+TELEGRAM_DAYS_BACK = 60
 
 GEMINI_MAX_RETRIES = 3
 GEMINI_RETRY_DELAY = 4
@@ -77,11 +77,10 @@ REQUEST_HEADERS = {
 
 
 # ==============================================================================
-# LOCAL FILTERS (پشتیبانی کامل از انگلیسی و فارسی)
+# LOCAL FILTERS (پشتیبانی کامل انگلیسی و فارسی)
 # ==============================================================================
 
 PHD_PATTERNS = [
-    # English
     r"\bph\.?\s*d\.?\b",
     r"\bphd\b",
     r"\bdoctoral\b",
@@ -92,8 +91,6 @@ PHD_PATTERNS = [
     r"\bfully funded phd\b",
     r"\bphd vacancy\b",
     r"\bphd opening\b",
-    r"\bphd opportunity\b",
-    # فارسی
     r"دکتری",
     r"دکترا",
     r"پوزیشن",
@@ -102,7 +99,6 @@ PHD_PATTERNS = [
     r"دانشجوی دکتری",
     r"موقعیت دکتری",
     r"فرصت دکتری",
-    r"پذیرش دکتری",
 ]
 
 STRONG_RESEARCH_PATTERNS = [
@@ -115,8 +111,6 @@ STRONG_RESEARCH_PATTERNS = [
     r"\bvisual localization\b",
     r"\bvisual localisation\b",
     r"\bslam\b",
-    r"\bsemantic slam\b",
-    r"\bvisual slam\b",
     r"\bvins\b",
 
     # Localization / Navigation
@@ -146,7 +140,7 @@ STRONG_RESEARCH_PATTERNS = [
     r"\bautonomous navigation\b",
     r"\bautonomous systems\b",
 
-    # اصطلاحات فارسی
+    # فارسی
     r"رباتیک",
     r"بینایی ماشین",
     r"ناوبری",
@@ -165,8 +159,6 @@ ADJACENT_RESEARCH_PATTERNS = [
     r"\bmachine learning\b",
     r"\bdeep learning\b",
     r"\bimage processing\b",
-    r"\bpoint cloud\b",
-    # فارسی
     r"پردازش تصویر",
     r"یادگیری عمیق",
     r"هوش مصنوعی",
@@ -178,13 +170,10 @@ HARD_EXCLUDE_PATTERNS = [
     r"\bundergraduate\b",
     r"\binternship\b",
     r"\bbiology\b",
-    r"\bmolecular\b",
     r"\bchemistry\b",
     r"\bchemical engineering\b",
     r"\bmaterials science\b",
     r"\bcfd\b",
-    r"\bfluid dynamics\b",
-    r"\bthermodynamics\b",
     r"پست داک",
     r"پسادکتری",
     r"کارآموزی",
@@ -213,9 +202,7 @@ def local_candidate_filter(title, description):
     strong_count = count_matches(text, STRONG_RESEARCH_PATTERNS)
     adjacent_count = count_matches(text, ADJACENT_RESEARCH_PATTERNS)
 
-    if strong_count >= 1:
-        return True
-    if adjacent_count >= 2:
+    if strong_count >= 1 or adjacent_count >= 2:
         return True
 
     return False
@@ -278,7 +265,7 @@ def is_recent(dt, days=TELEGRAM_DAYS_BACK):
 
 
 # ==============================================================================
-# TELEGRAM SCRAPER
+# TELEGRAM SCRAPER (اصلاح‌شده برای جلوگیری از باگ تگ‌های تو در تو)
 # ==============================================================================
 
 def scrape_telegram_channel(channel):
@@ -295,35 +282,39 @@ def scrape_telegram_channel(channel):
         return []
 
     results = []
-    blocks = re.findall(
-        r'<div class="tgme_widget_message_wrap".*?</div>\s*</div>',
-        page,
-        flags=re.DOTALL,
-    )
-    if not blocks:
-        blocks = re.findall(
-            r'<div class="tgme_widget_message".*?</div>\s*</div>',
-            page,
-            flags=re.DOTALL,
-        )
 
-    for block in blocks:
+    # شکستن کل صفحه بر اساس مرز هر پست تلگرام برای جلوگیری از باگ رگکس قبلی
+    raw_blocks = page.split('class="tgme_widget_message_wrap')
+    if len(raw_blocks) <= 1:
+        raw_blocks = page.split('class="tgme_widget_message ')
+
+    for block in raw_blocks[1:]:
+        # استخراج لینک پست
         url_match = re.search(r'href="(https://t\.me/[^"]+)"', block)
         if not url_match:
             continue
         post_url = html.unescape(url_match.group(1))
 
+        # استخراج متن کامل پست
         text_match = re.search(
-            r'<div class="tgme_widget_message_text[^>]*>(.*?)</div>',
+            r'<div class="tgme_widget_message_text[^>]*>(.*?)</div>\s*<div class="tgme_widget_message_footer',
             block,
             flags=re.DOTALL,
         )
+        if not text_match:
+            text_match = re.search(
+                r'<div class="tgme_widget_message_text[^>]*>(.*?)</div>',
+                block,
+                flags=re.DOTALL,
+            )
+
         text = ""
         if text_match:
             text = re.sub(r"<br\s*/?>", "\n", text_match.group(1))
             text = re.sub(r"<[^>]+>", " ", text)
             text = normalize_text(text)
 
+        # استخراج تاریخ
         date_match = re.search(r'<time[^>]+datetime="([^"]+)"', block)
         post_date = date_match.group(1) if date_match else None
 
@@ -360,7 +351,7 @@ def collect_telegram_candidates(seen):
         print(f"📡 Scanning @{channel}...")
         channel_results = scrape_telegram_channel(channel)
         new_results = [item for item in channel_results if item["uid"] not in seen]
-        print(f"   ✓ {len(new_results)} relevant local candidates")
+        print(f"   ✓ {len(new_results)} relevant candidates")
 
         candidates.extend(new_results)
         if len(candidates) >= MAX_TELEGRAM_CANDIDATES_PER_RUN:
@@ -371,12 +362,13 @@ def collect_telegram_candidates(seen):
 
 
 # ==============================================================================
-# FINDAPHD DIRECT SCRAPER (جایگزین سرچ ناموفق جمنای)
+# FINDAPHD DIRECT SCRAPER (اصلاح‌شده برای رفع خطای 404)
 # ==============================================================================
 
 def scrape_findaphd_keyword(keyword):
     encoded = quote(keyword)
-    url = f"https://www.findaphd.com/phd-programmes/?Keywords={encoded}"
+    # آدرس رسمی و فعال موتور جستجوی FindAPhD
+    url = f"https://www.findaphd.com/phds/?Keywords={encoded}"
 
     try:
         response = requests.get(url, headers=REQUEST_HEADERS, timeout=20)
@@ -390,7 +382,7 @@ def scrape_findaphd_keyword(keyword):
 
     results = []
 
-    # استخراج لینک‌ها و عناوین پروژه‌های دکتری
+    # استخراج عنوان و آدرس کامل پروژه‌ها
     matches = re.findall(
         r'<a\s+[^>]*href="(/phds/project/[^"]+)"[^>]*>(.*?)</a>',
         page,
@@ -400,14 +392,11 @@ def scrape_findaphd_keyword(keyword):
     for relative_url, raw_title in matches:
         title = normalize_text(re.sub(r"<[^>]+>", " ", raw_title))
 
-        # رد کردن لینک‌های فرعی یا دکمه‌های ناوبری کوتاه
         if len(title) < 15 or "read more" in title.lower() or "apply" in title.lower():
             continue
 
-        full_url = f"https://www.findaphd.com{relative_url.split('?')[0]}"
-
-        # عنوان پروژه‌های FindAPhD خود معتبرترین توصیف است
-        desc = f"PhD Opportunity on FindAPhD: {title}"
+        full_url = f"https://www.findaphd.com{relative_url}"
+        desc = f"PhD Opportunity on FindAPhD in {keyword}: {title}"
 
         if not local_candidate_filter(title, desc):
             continue
@@ -433,7 +422,7 @@ def collect_findaphd_candidates(seen):
         print(f"🌐 Scraping FindAPhD for: '{kw}'...")
         items = scrape_findaphd_keyword(kw)
         new_items = [it for it in items if it["uid"] not in seen]
-        print(f"   ✓ {len(new_items)} new candidates found")
+        print(f"   ✓ {len(new_items)} candidates found")
         candidates.extend(new_items)
         time.sleep(1)
 
@@ -442,7 +431,7 @@ def collect_findaphd_candidates(seen):
 
 
 # ==============================================================================
-# GEMINI EVALUATION (ارزیابی دقیق متنی)
+# GEMINI EVALUATION
 # ==============================================================================
 
 if not GEMINI_API_KEY:
@@ -513,7 +502,7 @@ You are evaluating PhD opportunities for a student with target research:
 - Mobile Robotics / 3D Vision
 
 Target: Funded Direct PhD.
-Reject: Non-PhD jobs, Master's-only, Unrelated engineering (civil, biological, chemical, mechanical CAD/CFD).
+Reject: Non-PhD jobs, Master's-only, Unrelated engineering fields.
 
 Output JSON schema:
 {
@@ -548,7 +537,6 @@ def evaluate_batch(batch):
 
     prompt = f"{EVALUATION_SYSTEM}\n\nCANDIDATES:\n" + "\n---\n".join(items_text)
 
-    # اجبار مدل به برگرداندن JSON خالص ساختاریافته
     config = types.GenerateContentConfig(
         response_mime_type="application/json"
     )
@@ -667,15 +655,15 @@ def main():
         print("\n❌ Gemini API test failed. Check API key.")
         return
 
-    # ۱. جمع‌آوری از تلگرام (با فیلتر فارسی و انگلیسی)
+    # ۱. استخراج از تلگرام
     telegram_candidates = collect_telegram_candidates(seen)
-    print(f"\n📊 Telegram candidates: {len(telegram_candidates)}")
+    print(f"\n📊 Total Telegram candidates: {len(telegram_candidates)}")
 
-    # ۲. جمع‌آوری مستقیم از FindAPhD
+    # ۲. استخراج مستقیم از FindAPhD
     findaphd_candidates = collect_findaphd_candidates(seen)
-    print(f"\n📊 FindAPhD candidates: {len(findaphd_candidates)}")
+    print(f"\n📊 Total FindAPhD candidates: {len(findaphd_candidates)}")
 
-    # ۳. ادغام و یکتا سازی
+    # ۳. تجمیع و حذف موارد تکراری
     all_candidates = telegram_candidates + findaphd_candidates
     unique = {}
     for it in all_candidates:
@@ -691,7 +679,7 @@ def main():
         save_seen(seen)
         return
 
-    # ۴. ارزیابی هوشمند توسط جمنای
+    # ۴. ارزیابی توسط مدل جمنای
     evaluated = evaluate_candidates(candidates)
 
     for it in evaluated:
