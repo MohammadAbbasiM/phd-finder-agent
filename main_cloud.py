@@ -49,7 +49,7 @@ SEARCH_QUERIES = [
     "State Estimation Robotics",
 ]
 
-SEEN_FILE = "seen_professors.json"
+SEEN_FILE = "data/seen_posts.json" if os.path.exists("data") else "seen_professors.json"
 
 # ارسال پیام گزارش وضعیت حتی در روزهایی که پوزیشن جدیدی یافت نمی‌شود
 SEND_EMPTY_RUN_SUMMARY = True
@@ -321,9 +321,12 @@ def load_seen():
 
 def save_seen(seen):
     try:
+        folder = os.path.dirname(SEEN_FILE)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
         with open(SEEN_FILE, "w", encoding="utf-8") as f:
             json.dump(sorted(seen), f, ensure_ascii=False, indent=2)
-        print(f"💾 Seen DB saved: {len(seen)} entries")
+        print(f"💾 Seen DB saved ({SEEN_FILE}): {len(seen)} entries")
     except Exception as e:
         print(f"⚠️ Could not save seen DB: {e}")
 
@@ -822,8 +825,8 @@ def evaluate_candidates(candidates):
 # ==============================================================================
 
 def telegram_send_message(text):
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TG_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("TG_CHAT_ID")
     if not bot_token or not chat_id:
         print("⚠️ Telegram bot credentials not configured.")
         return False
@@ -835,7 +838,7 @@ def telegram_send_message(text):
             json={
                 "chat_id": chat_id,
                 "text": text,
-                " disable_web_page_preview": True,
+                "disable_web_page_preview": True,
             },
             timeout=20,
         )
