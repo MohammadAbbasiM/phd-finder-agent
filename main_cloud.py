@@ -36,6 +36,8 @@ TELEGRAM_CHANNELS = [
     "computer_phd_apply",
     "EuropeanPhD",
     "PargarPositions",
+    "AzarApply",
+    "ApplyIR2UK",
 ]
 
 SEARCH_QUERIES = [
